@@ -7980,15 +7980,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source = event.source
         if service is None or getattr(source, "_dynamic_profile_resolved", False):
             return
+        transport_owner = getattr(source, "transport_owner_profile", None)
+        if (
+            isinstance(transport_owner, str)
+            and transport_owner.strip()
+            and transport_owner.strip() != "default"
+        ):
+            # Secondary/profile-owned adapters are distinct accounts. Their
+            # sources are stamped by the owning wrapper and never consult the
+            # shared primary binding database.
+            return
 
+        source.transport_owner_profile = "default"
         source._dynamic_profile_resolved = True
-        source._profile_transport_account_id = (
-            self._profile_account_id_for_source(source)
+        source._profile_transport_account_id = self._profile_account_id_for_source(
+            source
         )
         if event.internal:
             # Completion/background events stay in the profile captured by
             # their originating turn and never inspect or consume routing state.
             return
+
+        static_profile = getattr(source, "profile", None)
+        if (
+            not static_profile
+            and getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and getattr(source, "profile_route_rejected", False) is not True
+        ):
+            from gateway.profile_routing import ProfileRouteRejected
+
+            try:
+                static_profile = self._profile_name_for_source(source)
+            except ProfileRouteRejected:
+                source.profile_route_rejected = True
 
         from gateway.profile_switching.models import ScopeKey
 
@@ -8001,7 +8025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             scope=scope,
             actor_user_id=str(source.user_id or ""),
             consume_once=not bool(event.get_command()),
-            static_profile=getattr(source, "profile", None),
+            static_profile=static_profile,
         )
         source._dynamic_profile_resolution_source = resolution.source.value
         source.profile = resolution.profile_name
@@ -16258,7 +16282,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _handler(event):
             try:
-                if getattr(event, "source", None) is not None and not event.source.profile:
+                if (
+                    getattr(event, "source", None) is not None
+                    and not event.source.profile
+                ):
                     event.source.profile = profile_name
             except Exception:
                 pass
@@ -16269,19 +16296,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await self._handle_message(event)
 
             source = event.source
+            source.profile = profile_name
+            source.transport_owner_profile = profile_name
             if profile_home is not None:
-                # The adapter credential owner remains the authorization
-                # identity even when a static/dynamic route selects a different
-                # runtime profile for config, sessions, memory, and secrets.
+                # Secondary credentials and runtime state remain in the same
+                # owner profile; shared primary bindings never enter this path.
                 source._authorization_profile_home = profile_home
-            await self._resolve_dynamic_profile_for_event(event)
-            runtime_home = (
-                self._resolve_profile_home_for_source(source)
-                if getattr(source, "profile", None)
-                else profile_home
-            )
-            if runtime_home is not None:
-                with _profile_runtime_scope(runtime_home):
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
                     return await self._handle_message(event)
             return await self._handle_message(event)
 
@@ -16289,10 +16311,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _make_profile_busy_session_handler(self, profile_name: str):
         """Stamp an owning adapter's profile before resolving busy policy."""
+
         async def _handler(event, _session_key):
             try:
-                if getattr(event, "source", None) is not None and not event.source.profile:
-                    event.source.profile = profile_name
+                if getattr(event, "source", None) is not None:
+                    if getattr(self, "_profile_switching_service", None) is not None:
+                        event.source.profile = profile_name
+                        event.source.transport_owner_profile = profile_name
+                    elif not event.source.profile:
+                        event.source.profile = profile_name
             except Exception:
                 pass
             routed_session_key = self._session_key_for_source(event.source)
@@ -16326,6 +16353,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source._authorization_profile_home = default_home
             if (
                 not getattr(source, "profile", None)
+                and not getattr(source, "_dynamic_profile_resolved", False)
                 and getattr(source, "profile_route_rejected", False) is not True
             ):
                 from gateway.profile_routing import ProfileRouteRejected
@@ -16381,7 +16409,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_home = None
 
         async def _handler(event, source):
-            if getattr(source, "profile", None) is None:
+            if getattr(self, "_profile_switching_service", None) is not None:
+                source.profile = profile_name
+                source.transport_owner_profile = profile_name
+            elif getattr(source, "profile", None) is None:
                 source.profile = profile_name
             if profile_home is not None:
                 with _profile_runtime_scope(profile_home):
@@ -17236,6 +17267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             getattr(getattr(self, "config", None), "multiplex_profiles", False)
             and not getattr(source, "profile", None)
+            and not getattr(source, "_dynamic_profile_resolved", False)
             and getattr(source, "profile_route_rejected", False) is not True
         ):
             from gateway.profile_routing import ProfileRouteRejected
@@ -19570,6 +19602,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "_dynamic_profile_resolved",
                 "_dynamic_profile_resolution_source",
                 "_profile_transport_account_id",
+                "_transport_adapter_ref",
             ):
                 if hasattr(original_source, marker):
                     setattr(source, marker, getattr(original_source, marker))
@@ -19621,7 +19654,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
             service = getattr(self, "_profile_switching_service", None)
-            if service is not None:
+            transport_account_id = getattr(
+                source,
+                "_profile_transport_account_id",
+                None,
+            )
+            if service is not None and transport_account_id:
                 from gateway.profile_switching.models import ScopeKey
 
                 try:
@@ -19629,11 +19667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         service.note_session,
                         scope=ScopeKey.from_source(
                             source,
-                            account_id=getattr(
-                                source,
-                                "_profile_transport_account_id",
-                                "default",
-                            ),
+                            account_id=transport_account_id,
                         ),
                         profile_name=source.profile or "default",
                         session_id=session_entry.session_id,

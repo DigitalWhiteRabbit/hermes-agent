@@ -3809,7 +3809,10 @@ class BasePlatformAdapter(ABC):
         if recovered is None or str(recovered) == str(source.thread_id or ""):
             return
         try:
-            event.source = dataclasses.replace(source, thread_id=str(recovered))
+            replacement = dataclasses.replace(source, thread_id=str(recovered))
+            if hasattr(source, "_transport_adapter_ref"):
+                replacement._transport_adapter_ref = source._transport_adapter_ref
+            event.source = replacement
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
 
@@ -6202,15 +6205,23 @@ class BasePlatformAdapter(ABC):
             else None
         )
         if dynamic_service is not None:
-            resolve_profile = getattr(
-                runner,
-                "_resolve_dynamic_profile_for_event",
-                None,
-            )
-            if callable(resolve_profile):
-                resolution = resolve_profile(event)
-                if inspect.isawaitable(resolution):
-                    await resolution
+            owner_profile = getattr(self, "_owner_profile", None)
+            if isinstance(owner_profile, str) and owner_profile.strip():
+                # A secondary adapter is a distinct transport account. Until
+                # configured account aliases exist, shared ``:primary``
+                # bindings must never cross into that account's namespace.
+                event.source.profile = owner_profile
+                event.source.transport_owner_profile = owner_profile
+            else:
+                resolve_profile = getattr(
+                    runner,
+                    "_resolve_dynamic_profile_for_event",
+                    None,
+                )
+                if callable(resolve_profile):
+                    resolution = resolve_profile(event)
+                    if inspect.isawaitable(resolution):
+                        await resolution
 
         session_key = build_session_key(
             event.source,

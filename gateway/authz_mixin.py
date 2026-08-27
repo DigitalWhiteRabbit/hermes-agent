@@ -144,6 +144,13 @@ class GatewayAuthorizationMixin:
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
+        transport_owner = getattr(source, "transport_owner_profile", None)
+        if isinstance(transport_owner, str) and transport_owner.strip():
+            owner_profile = transport_owner.strip()
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                None if owner_profile == "default" else owner_profile,
+            )
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
@@ -186,6 +193,10 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
+        transport_owner = getattr(source, "transport_owner_profile", None)
+        if isinstance(transport_owner, str) and transport_owner.strip():
+            owner_profile = transport_owner.strip()
+            return None if owner_profile == "default" else owner_profile
         return getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(

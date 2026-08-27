@@ -56,6 +56,28 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
 
+    def test_transport_owner_profile_roundtrip_and_legacy_default(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            profile="coder",
+            transport_owner_profile="default",
+        )
+
+        serialized = source.to_dict()
+        restored = SessionSource.from_dict(serialized)
+        legacy = SessionSource.from_dict({
+            "platform": "telegram",
+            "chat_id": "12345",
+            "profile": "coder",
+        })
+
+        assert serialized["transport_owner_profile"] == "default"
+        assert restored.profile == "coder"
+        assert restored.transport_owner_profile == "default"
+        assert legacy.profile == "coder"
+        assert legacy.transport_owner_profile is None
+
 
 class TestSessionSourceDescription:
     def test_local_cli(self):
@@ -1630,6 +1652,27 @@ class TestGatewayRoutingTable:
         assert rehydrated.model_override == {"model": "test-model"}
         restarted._db.close()
 
+    def test_dynamic_transport_owner_survives_database_restart(self, tmp_path):
+        config = GatewayConfig(multiplex_profiles=True)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = self._source()
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        entry = store.get_or_create_session(source)
+
+        (tmp_path / "sessions.json").unlink()
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        restored = restarted._entries[entry.session_key].origin
+
+        assert entry.session_key == "agent:coder:telegram:dm:chat-1"
+        assert restored is not None
+        assert restored.profile == "coder"
+        assert restored.transport_owner_profile == "default"
+        restarted._db.close()
+
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1642,5 +1685,3 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
-

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -19,9 +19,12 @@ from gateway.profile_routing import ProfileRoute
 from gateway.profile_switching.models import ScopeKey, ScopeKind
 from gateway.profile_switching.policy import ProfilePolicy
 from gateway.profile_switching.service import ProfileSwitchingService
-from gateway.profile_switching.store import ProfileRoutingStore
+from gateway.profile_switching.store import (
+    ProfileRoutingStore,
+    ProfileRoutingStoreUnavailable,
+)
 from gateway.run import GatewayRunner
-from gateway.session import SessionEntry
+from gateway.session import SessionEntry, SessionSource
 from hermes_constants import get_hermes_home
 
 
@@ -128,9 +131,7 @@ async def _dispatch_through_primary_wrapper(
 
     async def capture(resolved_event: MessageEvent):
         captured["profile"] = resolved_event.source.profile
-        captured["session_key"] = runner._session_key_for_source(
-            resolved_event.source
-        )
+        captured["session_key"] = runner._session_key_for_source(resolved_event.source)
         captured["runtime_home"] = get_hermes_home()
         captured["authorization_home"] = getattr(
             resolved_event.source,
@@ -198,9 +199,7 @@ async def test_thread_binding_overrides_chat_binding(tmp_path):
     captured = await _dispatch_through_primary_wrapper(runner, event)
 
     assert captured["profile"] == "coder"
-    assert captured["session_key"] == (
-        "agent:coder:telegram:dm:chat-1:thread-7"
-    )
+    assert captured["session_key"] == ("agent:coder:telegram:dm:chat-1:thread-7")
 
 
 @pytest.mark.asyncio
@@ -258,8 +257,8 @@ async def test_primary_adapter_resolves_before_busy_session_key(tmp_path):
     adapter.gateway_runner = runner
     adapter.set_message_handler(runner._make_default_profile_message_handler())
     captured_keys: list[str] = []
-    adapter._start_session_processing = (
-        lambda _event, session_key: captured_keys.append(session_key)
+    adapter._start_session_processing = lambda _event, session_key: (
+        captured_keys.append(session_key)
     )
 
     await adapter.handle_message(event)
@@ -268,28 +267,35 @@ async def test_primary_adapter_resolves_before_busy_session_key(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_secondary_adapter_keeps_auth_home_while_routing_before_key(
+async def test_secondary_adapter_skips_primary_routing_and_preserves_once(
     tmp_path,
 ):
     runner, store = _runner_with_store(tmp_path)
     homes = _create_profile_homes()
-    event = _event(runner)
-    store.set_once(
-        _scope(event),
-        profile_name="research",
-        created_by_user_id="user-1",
-    )
     adapter = _StubAdapter(
         PlatformConfig(enabled=True),
         Platform.TELEGRAM,
     )
     adapter.gateway_runner = runner
     adapter.set_owner_profile("origin")
+    event = MessageEvent(
+        text="hello",
+        source=adapter.build_source(
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+    store.set_once(
+        _scope(event),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
     handler = runner._make_profile_message_handler("origin")
     adapter.set_message_handler(handler)
     captured_keys: list[str] = []
-    adapter._start_session_processing = (
-        lambda _event, session_key: captured_keys.append(session_key)
+    adapter._start_session_processing = lambda _event, session_key: (
+        captured_keys.append(session_key)
     )
     captured: dict[str, object] = {}
 
@@ -306,9 +312,50 @@ async def test_secondary_adapter_keeps_auth_home_while_routing_before_key(
     await adapter.handle_message(event)
     await handler(event)
 
-    assert captured_keys == ["agent:research:telegram:dm:chat-1"]
-    assert captured["runtime_home"] == homes["research"]
+    assert captured_keys == ["agent:origin:telegram:dm:chat-1"]
+    assert event.source.profile == "origin"
+    assert event.source.transport_owner_profile == "origin"
+    assert not hasattr(event.source, "_dynamic_profile_resolved")
+    assert captured["runtime_home"] == homes["origin"]
     assert captured["authorization_home"] == homes["origin"]
+
+    primary = _event(runner)
+    await runner._resolve_dynamic_profile_for_event(primary)
+    assert primary.source.profile == "research"
+
+
+@pytest.mark.asyncio
+async def test_primary_topic_recovery_preserves_live_transport_owner(tmp_path):
+    runner, store = _runner_with_store(tmp_path)
+    adapter = _StubAdapter(
+        PlatformConfig(enabled=True),
+        Platform.TELEGRAM,
+    )
+    adapter.gateway_runner = runner
+    adapter.set_topic_recovery_fn(lambda _source: "topic-7")
+    adapter.set_message_handler(AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    event = MessageEvent(
+        text="hello",
+        source=adapter.build_source(
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+    _set_binding(store, _scope(event), ScopeKind.CHAT, "coder")
+    captured_keys: list[str] = []
+    adapter._start_session_processing = lambda _event, session_key: (
+        captured_keys.append(session_key)
+    )
+
+    await adapter.handle_message(event)
+
+    assert captured_keys == ["agent:coder:telegram:dm:chat-1:topic-7"]
+    assert event.source.profile == "coder"
+    assert event.source.transport_owner_profile == "default"
+    assert event.source._transport_adapter_ref() is adapter
+    assert runner._adapter_for_source(event.source) is adapter
 
 
 @pytest.mark.asyncio
@@ -327,6 +374,7 @@ async def test_disabled_switching_preserves_secondary_runtime_scope(tmp_path):
     await runner._make_profile_message_handler("origin")(event)
 
     assert captured["runtime_home"] == homes["origin"]
+    assert event.source.profile == "static"
 
 
 @pytest.mark.asyncio
@@ -384,6 +432,124 @@ async def test_direct_handle_message_uses_dynamic_resolution_fallback(tmp_path):
     assert event.source.profile == "research"
 
 
+@pytest.mark.asyncio
+async def test_direct_unstamped_source_evaluates_allowed_static_candidate(tmp_path):
+    runner, _store = _runner_with_store(tmp_path)
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+    runner._startup_restore_in_progress = True
+    runner._queue_startup_restore_event = lambda _event: None
+
+    assert await GatewayRunner._handle_message(runner, event) is None
+    assert event.source.profile == "static"
+    assert event.source._dynamic_profile_resolution_source == "static"
+
+
+def _install_denied_static_service(
+    runner: GatewayRunner,
+    tmp_path: Path,
+    *,
+    denial: str,
+    db_unavailable: bool,
+) -> None:
+    static_users = ("other-user",) if denial == "unauthorized" else ("user-1",)
+    config = ProfileSwitchingConfig(
+        enabled=True,
+        hidden=("static",) if denial == "hidden" else (),
+        rules=(
+            ProfileSwitchRule("default", users=("user-1",), chats=("*",)),
+            ProfileSwitchRule("static", users=static_users, chats=("*",)),
+        ),
+    )
+
+    if db_unavailable:
+
+        class _UnavailableStore:
+            def claim_once(self, _scope):
+                raise ProfileRoutingStoreUnavailable("database unavailable")
+
+            def get_binding(self, _scope, _scope_kind):
+                raise ProfileRoutingStoreUnavailable("database unavailable")
+
+        routing_store = _UnavailableStore()
+    else:
+        routing_store = ProfileRoutingStore(tmp_path / f"{denial}.db")
+
+    policy = ProfilePolicy(
+        config,
+        served_profiles=(
+            {"default"} if denial == "unserved" else {"default", "static"}
+        ),
+        existing_profiles={"default", "static"},
+    )
+    runner._profile_switching_service = ProfileSwitchingService(
+        routing_store,
+        policy,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ["unserved", "hidden", "unauthorized"])
+@pytest.mark.parametrize("db_unavailable", [False, True])
+async def test_denied_static_is_not_reapplied_after_dynamic_resolution(
+    tmp_path,
+    denial,
+    db_unavailable,
+):
+    runner, _store = _runner_with_store(tmp_path)
+    _install_denied_static_service(
+        runner,
+        tmp_path,
+        denial=denial,
+        db_unavailable=db_unavailable,
+    )
+    adapter = _StubAdapter(
+        PlatformConfig(enabled=True),
+        Platform.TELEGRAM,
+    )
+    adapter.gateway_runner = runner
+    adapter.set_session_store(
+        SimpleNamespace(
+            _resolve_profile_for_key=lambda source: source.profile or "default"
+        )
+    )
+    event = MessageEvent(
+        text="hello",
+        source=adapter.build_source(
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+    handler = runner._make_default_profile_message_handler()
+    adapter.set_message_handler(handler)
+    captured_keys: list[str] = []
+    adapter._start_session_processing = lambda _event, session_key: (
+        captured_keys.append(session_key)
+    )
+
+    await adapter.handle_message(event)
+    assert captured_keys == ["agent:main:telegram:dm:chat-1"]
+    assert event.source.profile is None
+
+    captured = await _dispatch_through_primary_wrapper(runner, event)
+    assert captured["profile"] is None
+    assert captured["session_key"] == "agent:main:telegram:dm:chat-1"
+
+    direct = _event(runner)
+    runner._startup_restore_in_progress = True
+    runner._queue_startup_restore_event = lambda _event: None
+    assert await GatewayRunner._handle_message(runner, direct) is None
+    assert direct.source.profile is None
+
+
 def test_transport_account_identity_is_stable_across_runtime_profiles(tmp_path):
     runner, _store = _runner_with_store(tmp_path)
     first = _event(runner).source
@@ -436,6 +602,45 @@ async def test_session_observation_failure_is_nonfatal(tmp_path, caplog):
 
     assert result is None
     assert "Failed to record dynamic profile session observation" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_secondary_session_skips_primary_account_observation(tmp_path):
+    runner, _store = _runner_with_store(tmp_path)
+    note_session = MagicMock()
+    runner._profile_switching_service = SimpleNamespace(note_session=note_session)
+    source = _event(runner).source
+    source.profile = "origin"
+    source.transport_owner_profile = "origin"
+    now = datetime.now()
+    entry = SessionEntry(
+        session_key="agent:origin:telegram:dm:chat-1",
+        session_id="session-1",
+        created_at=now,
+        updated_at=now,
+    )
+    runner.session_store = object()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=entry),
+    )
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._resolve_async_delegation_session = AsyncMock(return_value=None)
+    event = MessageEvent(
+        text="hello",
+        source=source,
+        metadata={"gateway_session_id": "stop-after-observation"},
+    )
+
+    result = await runner._handle_message_with_agent(
+        event,
+        source,
+        entry.session_key,
+        1,
+    )
+
+    assert result is None
+    note_session.assert_not_called()
 
 
 @pytest.mark.asyncio
