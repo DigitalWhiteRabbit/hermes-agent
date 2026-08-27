@@ -2,7 +2,13 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from gateway.config import GatewayConfig
+from gateway.config import GatewayConfig, ProfileSwitchingConfig
+
+
+_EXPLICIT_ALLOWLIST_ERROR = (
+    "profile_switching.enabled requires an explicit "
+    "gateway.multiplex_profile_allowlist; use [] for default-only"
+)
 
 
 def test_profile_switching_defaults_disabled():
@@ -40,6 +46,82 @@ def test_enabled_switching_requires_multiplex():
         GatewayConfig.from_dict({
             "gateway": {"profile_switching": {"enabled": True}}
         })
+
+
+def test_enabled_switching_rejects_omitted_nested_allowlist():
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig.from_dict({
+            "gateway": {
+                "multiplex_profiles": True,
+                "profile_switching": {"enabled": True},
+            }
+        })
+    assert str(exc_info.value) == _EXPLICIT_ALLOWLIST_ERROR
+
+
+def test_enabled_switching_rejects_explicit_null_nested_allowlist():
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig.from_dict({
+            "gateway": {
+                "multiplex_profiles": True,
+                "multiplex_profile_allowlist": None,
+                "profile_switching": {"enabled": True},
+            }
+        })
+    assert str(exc_info.value) == _EXPLICIT_ALLOWLIST_ERROR
+
+
+def test_top_level_null_allowlist_overrides_nested_safe_list_and_is_rejected():
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig.from_dict({
+            "multiplex_profile_allowlist": None,
+            "gateway": {
+                "multiplex_profiles": True,
+                "multiplex_profile_allowlist": ["coder"],
+                "profile_switching": {"enabled": True},
+            },
+        })
+    assert str(exc_info.value) == _EXPLICIT_ALLOWLIST_ERROR
+
+
+def test_direct_constructor_rejects_enabled_switching_without_allowlist():
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+    assert str(exc_info.value) == _EXPLICIT_ALLOWLIST_ERROR
+
+
+def test_enabled_switching_accepts_explicit_empty_allowlist_as_default_only():
+    cfg = GatewayConfig.from_dict({
+        "gateway": {
+            "multiplex_profiles": True,
+            "multiplex_profile_allowlist": [],
+            "profile_switching": {"enabled": True},
+        }
+    })
+
+    assert cfg.multiplex_profile_allowlist == []
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"gateway": {"multiplex_profiles": True}},
+        {
+            "gateway": {
+                "multiplex_profiles": True,
+                "multiplex_profile_allowlist": None,
+            }
+        },
+    ],
+)
+def test_feature_off_preserves_omitted_and_null_serve_all_allowlist(raw):
+    cfg = GatewayConfig.from_dict(raw)
+
+    assert cfg.profile_switching.enabled is False
+    assert cfg.multiplex_profile_allowlist is None
 
 
 def test_visible_profile_must_be_served():

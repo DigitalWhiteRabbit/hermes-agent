@@ -1095,6 +1095,42 @@ def test_service_revalidates_deleted_profile_after_startup(tmp_path):
     assert resolution.source.value == "default"
 
 
+def test_explicit_allowlist_excludes_installed_production_from_served_topology(
+    tmp_path,
+):
+    from gateway.run import _multiplex_profile_homes
+
+    homes = _create_profile_homes()
+    production_home = get_hermes_home() / "profiles" / "production"
+    production_home.mkdir(parents=True)
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=["coder"],
+        profile_switching=ProfileSwitchingConfig(
+            enabled=True,
+            rules=(
+                ProfileSwitchRule(
+                    "coder",
+                    users=("user-1",),
+                    chats=("*",),
+                ),
+            ),
+        ),
+    )
+
+    multiplex_homes = dict(_multiplex_profile_homes(config))
+    service = ProfileSwitchingService.from_gateway_config(
+        config,
+        db_path=tmp_path / "profile-routing.db",
+    )
+
+    assert multiplex_homes == {
+        "default": homes["default"],
+        "coder": homes["coder"],
+    }
+    assert "production" not in service._policy._served_profiles
+
+
 def test_service_revalidates_unreadable_profile_after_startup(tmp_path):
     homes = _create_profile_homes()
     config = _gateway_config()

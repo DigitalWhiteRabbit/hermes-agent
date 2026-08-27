@@ -63,6 +63,7 @@ def _make_transport_lookup_runner():
     runner._profile_adapters = {}
     runner.config = GatewayConfig(
         multiplex_profiles=True,
+        multiplex_profile_allowlist=["coder"],
         profile_switching=ProfileSwitchingConfig(enabled=True),
     )
     runner.pairing_store = MagicMock()

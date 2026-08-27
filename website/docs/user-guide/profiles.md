@@ -234,6 +234,25 @@ profiles are the only profiles served by this gateway configuration. The
 unserved here: sensitive profiles must use separate bot tokens and separate
 gateways, not this shared primary account.
 
+When `profile_switching.enabled: true`,
+`gateway.multiplex_profile_allowlist` is a mandatory security boundary. It
+must be an explicit finite list: omitting it or setting it to `null` aborts
+gateway configuration loading. Use `[]` when the primary gateway should serve
+only the default profile. Hermes does not discover installed profile
+directories to fill this list.
+
+`profile_switching.hidden` controls dynamic picker and policy visibility; it
+does not remove a profile from multiplex adapters, cron, API/webhook prefixes,
+or any other served topology. Exclude a profile from the allowlist to keep it
+unserved.
+
+:::warning Migration from an earlier Milestone 1 configuration
+If dynamic routing was enabled without `multiplex_profile_allowlist`, add the
+complete intended served set before restarting. Use `[]` for default-only.
+Leaving the key absent or changing it to `null` is now rejected instead of
+implicitly serving every installed profile.
+:::
+
 When dynamic routing is enabled, Milestone 1 rejects those three sensitive
 names if they appear in the served allowlist, visible profiles, or switch
 rules. It also rejects `require_confirmation: true`: confirmation UI is not
@@ -289,7 +308,9 @@ Setting `gateway.profile_switching.enabled: false` (the default) leaves the
 existing static routes unchanged, does not initialize the switching service,
 does not create `state/profile-routing.db`, omits the switching block from
 serialized gateway config, and retains the legacy feature-off session wire
-shape without dynamic transport-provenance fields.
+shape without dynamic transport-provenance fields. It also preserves the
+historical multiplex rule that an omitted or `null` allowlist serves all
+installed profiles.
 
 :::note Inside the official Docker image
 Per-profile gateways are supervised by [s6-overlay](https://github.com/just-containers/s6-overlay) (PID 1 in the container), so `hermes profile create <name>` automatically registers an s6 service slot at `/run/service/gateway-<name>/`. `hermes -p <name> gateway start/stop/restart` dispatches to `s6-svc` instead of spawning a bare process — crashes are auto-restarted and `docker restart` preserves the previously-running set of gateways. See [Per-profile gateway supervision](/user-guide/docker#per-profile-gateway-supervision) for details.

@@ -88,6 +88,26 @@ def _normalize_multiplex_profile_allowlist(value: Any) -> Optional[List[str]]:
     return normalized
 
 
+def _validate_profile_switching_gateway_contract(
+    *,
+    enabled: object,
+    multiplex_profiles: bool,
+    multiplex_profile_allowlist: Optional[List[str]],
+) -> None:
+    """Validate feature-on requirements shared by parsed and direct configs."""
+    if enabled is not True:
+        return
+    if not multiplex_profiles:
+        raise ValueError(
+            "profile_switching.enabled requires gateway.multiplex_profiles"
+        )
+    if multiplex_profile_allowlist is None:
+        raise ValueError(
+            "profile_switching.enabled requires an explicit "
+            "gateway.multiplex_profile_allowlist; use [] for default-only"
+        )
+
+
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
 # override. Anything not in either set — and a blank/whitespace value — is
 # treated as "unset" so it falls through to config.yaml rather than silently
@@ -1131,10 +1151,11 @@ class ProfileSwitchingConfig:
                 "profile_switching profiles cannot be both visible and hidden: "
                 f"{sorted(overlap)}"
             )
-        if enabled and not multiplex_profiles:
-            raise ValueError(
-                "profile_switching.enabled requires gateway.multiplex_profiles"
-            )
+        _validate_profile_switching_gateway_contract(
+            enabled=enabled,
+            multiplex_profiles=multiplex_profiles,
+            multiplex_profile_allowlist=multiplex_profile_allowlist,
+        )
         if multiplex_profile_allowlist is not None:
             served_profiles = {"default", *multiplex_profile_allowlist}
             unserved = set(default_visible) - served_profiles
@@ -1270,6 +1291,11 @@ class GatewayConfig:
     def __post_init__(self) -> None:
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
             self.multiplex_profile_allowlist
+        )
+        _validate_profile_switching_gateway_contract(
+            enabled=self.profile_switching.enabled,
+            multiplex_profiles=self.multiplex_profiles,
+            multiplex_profile_allowlist=self.multiplex_profile_allowlist,
         )
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds

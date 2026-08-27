@@ -1676,6 +1676,7 @@ class TestGatewayRoutingTable:
     def test_dynamic_transport_owner_survives_database_restart(self, tmp_path):
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1704,6 +1705,7 @@ class TestGatewayRoutingTable:
     ):
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1738,6 +1740,7 @@ class TestGatewayRoutingTable:
     ):
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1814,6 +1817,7 @@ class TestGatewayRoutingTable:
         """
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1967,6 +1971,7 @@ class TestGatewayRoutingTable:
         """A stale metadata writer cannot overwrite a completed origin commit."""
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -2057,6 +2062,7 @@ class TestGatewayRoutingTable:
         """A delayed lifecycle peer write cannot overwrite a newer live origin."""
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -2164,6 +2170,7 @@ class TestGatewayRoutingTable:
         """Metadata-only writes must not rewrite the complete routing index."""
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -2196,6 +2203,7 @@ class TestGatewayRoutingTable:
         """A partial provenance write is never reported as a successful commit."""
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -2259,6 +2267,7 @@ class TestGatewayRoutingTable:
     def test_adjacent_flight_cannot_overtake_old_origin_waiter(self, tmp_path):
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -2341,6 +2350,7 @@ class TestGatewayRoutingTable:
         """A later adjacent owner cannot barge ahead of an old queued waiter."""
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -2433,6 +2443,7 @@ class TestGatewayRoutingTable:
     ):
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -2480,6 +2491,7 @@ class TestGatewayRoutingTable:
     def test_legacy_dynamic_session_backfills_transport_provenance(self, tmp_path):
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)

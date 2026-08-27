@@ -712,6 +712,8 @@ async def test_reconnect_reschedule_is_platform_scoped():
 @pytest.mark.asyncio
 async def test_dynamic_profile_auto_resume_uses_persisted_primary_owner():
     runner, primary = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    runner.config.multiplex_profile_allowlist = ["coder"]
     runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
     secondary = object()
     runner._profile_adapters = {
@@ -757,6 +759,8 @@ async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
     monkeypatch,
 ):
     runner, native = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    runner.config.multiplex_profile_allowlist = ["coder"]
     runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
     _clear_names = (
         "DISCORD_ALLOWED_USERS",
@@ -783,6 +787,7 @@ async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
         sessions_dir=tmp_path,
         config=GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         ),
     )
@@ -806,6 +811,7 @@ async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
         sessions_dir=tmp_path,
         config=GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         ),
     )
@@ -835,6 +841,8 @@ async def test_relay_reconnect_retries_only_persisted_relay_transport_bucket(
     monkeypatch,
 ):
     runner, native = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    runner.config.multiplex_profile_allowlist = ["coder"]
     runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
     for name in (
         "DISCORD_ALLOWED_USERS",
@@ -852,6 +860,7 @@ async def test_relay_reconnect_retries_only_persisted_relay_transport_bucket(
         sessions_dir=tmp_path,
         config=GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         ),
     )
@@ -895,6 +904,7 @@ async def test_relay_reconnect_retries_only_persisted_relay_transport_bucket(
         sessions_dir=tmp_path,
         config=GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         ),
     )

@@ -174,6 +174,7 @@ class TestSaveOutsideLock:
         """Routing JSON/SQLite and peer SQLite stay outside the store lock."""
         config = GatewayConfig(
             multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         with patch("gateway.session.SessionStore._ensure_loaded"):
