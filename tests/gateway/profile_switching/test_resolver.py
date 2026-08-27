@@ -250,3 +250,19 @@ def test_policy_errors_are_not_treated_as_database_fallback(tmp_path):
             consume_once=False,
             static_profile="static",
         )
+
+
+def test_non_store_unavailable_read_errors_propagate():
+    class BrokenStore:
+        def get_binding(self, scope, scope_kind):
+            raise RuntimeError("store programming bug")
+
+    resolver = ProfileResolver(BrokenStore(), _policy("static"))
+
+    with pytest.raises(RuntimeError, match="store programming bug"):
+        resolver.resolve(
+            _scope(),
+            actor_user_id="user-1",
+            consume_once=False,
+            static_profile="static",
+        )

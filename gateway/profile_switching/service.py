@@ -11,7 +11,10 @@ from .models import (
 )
 from .policy import ProfilePolicy
 from .resolver import ProfileResolver
-from .store import ProfileRoutingStore
+from .store import ProfileBindingChanged, ProfileRoutingStore
+
+
+_CLEAR_RETRY_LIMIT = 3
 
 
 class ProfileSwitchError(RuntimeError):
@@ -134,7 +137,7 @@ class ProfileSwitchingService:
         scope_kind: ScopeKind,
         actor_user_id: str,
         source: str,
-        new_profile: str,
+        new_profile: str | None,
     ) -> None:
         if not active_turn:
             return
@@ -185,24 +188,13 @@ class ProfileSwitchingService:
             source="command",
             new_profile=profile_name,
         )
-        old_binding = self._store.get_binding(scope, scope_kind)
-        binding = self._store.set_binding(
+        return self._store.set_binding_with_audit(
             scope,
             scope_kind,
             profile_name=profile_name,
             created_by_user_id=actor_user_id,
-        )
-        self._audit(
-            actor_user_id=actor_user_id,
-            scope=scope,
-            old_profile=(old_binding.profile_name if old_binding else None),
-            new_profile=profile_name,
-            scope_kind=scope_kind,
             source="command",
-            result="allowed",
-            reason_code=ReasonCode.ALLOWED,
         )
-        return binding
 
     def set_once(
         self,
@@ -231,22 +223,12 @@ class ProfileSwitchingService:
             source="once",
             new_profile=profile_name,
         )
-        binding = self._store.set_once(
+        return self._store.set_once_with_audit(
             scope,
             profile_name=profile_name,
             created_by_user_id=actor_user_id,
-        )
-        self._audit(
-            actor_user_id=actor_user_id,
-            scope=scope,
-            old_profile=None,
-            new_profile=profile_name,
-            scope_kind=scope_kind,
             source="once",
-            result="allowed",
-            reason_code=ReasonCode.ALLOWED,
         )
-        return binding
 
     def clear(
         self,
@@ -254,6 +236,7 @@ class ProfileSwitchingService:
         scope: ScopeKey,
         scope_kind: ScopeKind,
         actor_user_id: str,
+        active_turn: bool,
     ) -> bool:
         scope_kind = ScopeKind(scope_kind)
         self._require_scope(
@@ -263,29 +246,42 @@ class ProfileSwitchingService:
             new_profile=None,
             source="clear",
         )
-        old_binding = self._store.get_binding(scope, scope_kind)
-        if old_binding is not None:
-            self._authorize(
-                profile_name=old_binding.profile_name,
-                scope=scope,
-                scope_kind=scope_kind,
-                actor_user_id=actor_user_id,
-                source="clear",
-                old_profile=old_binding.profile_name,
-                new_profile=None,
-            )
-        removed = self._store.clear_binding(scope, scope_kind)
-        self._audit(
-            actor_user_id=actor_user_id,
+        self._require_idle(
+            active_turn=active_turn,
             scope=scope,
-            old_profile=(old_binding.profile_name if old_binding else None),
-            new_profile=None,
             scope_kind=scope_kind,
+            actor_user_id=actor_user_id,
             source="clear",
-            result="allowed",
-            reason_code=ReasonCode.ALLOWED,
+            new_profile=None,
         )
-        return removed
+        for _attempt in range(_CLEAR_RETRY_LIMIT):
+            old_binding = self._store.get_binding(scope, scope_kind)
+            if old_binding is not None:
+                self._authorize(
+                    profile_name=old_binding.profile_name,
+                    scope=scope,
+                    scope_kind=scope_kind,
+                    actor_user_id=actor_user_id,
+                    source="clear",
+                    old_profile=old_binding.profile_name,
+                    new_profile=None,
+                )
+            try:
+                return self._store.clear_binding_with_audit(
+                    scope,
+                    scope_kind,
+                    expected_version=(old_binding.version if old_binding else None),
+                    expected_profile=(
+                        old_binding.profile_name if old_binding else None
+                    ),
+                    actor_user_id=actor_user_id,
+                    source="clear",
+                )
+            except ProfileBindingChanged:
+                continue
+        raise ProfileSwitchError(
+            "profile binding kept changing during authorized clear"
+        )
 
     def resolve(
         self,

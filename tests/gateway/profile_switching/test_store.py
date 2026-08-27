@@ -8,13 +8,30 @@ from contextlib import closing
 
 import pytest
 
+import gateway.profile_switching.store as store_module
 from gateway.profile_switching.migrations import LATEST_SCHEMA_VERSION
 from gateway.profile_switching.models import ReasonCode, ScopeKey, ScopeKind
-from gateway.profile_switching.store import ProfileRoutingStore
+from gateway.profile_switching.store import (
+    ProfileRoutingStore,
+    ProfileRoutingStoreUnavailable,
+)
 
 
 def _scope(thread_id: str | None = None) -> ScopeKey:
     return ScopeKey("telegram", "telegram:primary", "chat-1", thread_id)
+
+
+def _reject_audit_inserts(store: ProfileRoutingStore) -> None:
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER reject_profile_switch_audit
+            BEFORE INSERT ON profile_switch_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'injected audit failure');
+            END
+            """
+        )
 
 
 def test_migration_creates_schema_and_enables_foreign_keys(tmp_path):
@@ -88,6 +105,30 @@ def test_set_binding_upserts_and_increments_version(tmp_path):
         )
 
 
+def test_atomic_set_binding_rolls_back_when_audit_insert_fails(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    _reject_audit_inserts(store)
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        store.set_binding_with_audit(
+            _scope(),
+            ScopeKind.CHAT,
+            profile_name="coder",
+            created_by_user_id="user-1",
+            source="command",
+        )
+
+    binding = store.get_binding(_scope(), ScopeKind.CHAT)
+    assert binding is not None and binding.profile_name == "research"
+    assert binding.version == 1
+
+
 def test_thread_and_chat_bindings_are_distinct(tmp_path):
     store = ProfileRoutingStore(tmp_path / "profile-routing.db")
     threaded = _scope("thread-7")
@@ -147,6 +188,116 @@ def test_clear_binding_only_removes_requested_scope(tmp_path):
     assert store.get_binding(threaded, ScopeKind.CHAT) is not None
 
 
+def test_atomic_clear_rolls_back_when_audit_insert_fails(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    binding = store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    _reject_audit_inserts(store)
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        store.clear_binding_with_audit(
+            _scope(),
+            ScopeKind.CHAT,
+            expected_version=binding.version,
+            expected_profile=binding.profile_name,
+            actor_user_id="user-1",
+            source="clear",
+        )
+
+    remaining = store.get_binding(_scope(), ScopeKind.CHAT)
+    assert remaining is not None and remaining.profile_name == "coder"
+
+
+def test_atomic_clear_rejects_stale_version_without_deleting_replacement(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    stale = store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    replacement = store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="research",
+        created_by_user_id="user-2",
+    )
+
+    with pytest.raises(store_module.ProfileBindingChanged):
+        store.clear_binding_with_audit(
+            _scope(),
+            ScopeKind.CHAT,
+            expected_version=stale.version,
+            expected_profile=stale.profile_name,
+            actor_user_id="user-1",
+            source="clear",
+        )
+
+    remaining = store.get_binding(_scope(), ScopeKind.CHAT)
+    assert remaining == replacement
+    with sqlite3.connect(store.path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM profile_switch_audit").fetchone()[0] == 0
+        )
+
+
+def test_atomic_clear_rejects_delete_and_recreate_with_reset_version(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    stale = store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    assert store.clear_binding(_scope(), ScopeKind.CHAT)
+    replacement = store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="research",
+        created_by_user_id="user-2",
+    )
+    assert replacement.version == stale.version == 1
+
+    with pytest.raises(store_module.ProfileBindingChanged):
+        store.clear_binding_with_audit(
+            _scope(),
+            ScopeKind.CHAT,
+            expected_version=stale.version,
+            expected_profile=stale.profile_name,
+            actor_user_id="user-1",
+            source="clear",
+        )
+
+    assert store.get_binding(_scope(), ScopeKind.CHAT) == replacement
+
+
+def test_atomic_clear_treats_expired_binding_as_logically_absent(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db", clock=lambda: 20.0)
+    store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+        expires_at=20.0,
+    )
+
+    assert store.clear_binding_with_audit(
+        _scope(),
+        ScopeKind.CHAT,
+        expected_version=None,
+        expected_profile=None,
+        actor_user_id="user-1",
+        source="clear",
+    )
+
+    with sqlite3.connect(store.path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM profile_bindings").fetchone()[0] == 0
+
+
 def test_claim_once_returns_value_exactly_once(tmp_path):
     store = ProfileRoutingStore(tmp_path / "profile-routing.db")
     store.set_once(
@@ -161,6 +312,27 @@ def test_claim_once_returns_value_exactly_once(tmp_path):
     assert claimed.profile_name == "research"
     assert claimed.scope.thread_id is None
     assert store.claim_once(_scope()) is None
+
+
+def test_atomic_set_once_rolls_back_when_audit_insert_fails(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    store.set_once(
+        _scope(),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    _reject_audit_inserts(store)
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        store.set_once_with_audit(
+            _scope(),
+            profile_name="coder",
+            created_by_user_id="user-1",
+            source="once",
+        )
+
+    once = store.claim_once(_scope())
+    assert once is not None and once.profile_name == "research"
 
 
 def test_empty_thread_id_is_returned_as_absent_from_once_binding(tmp_path):

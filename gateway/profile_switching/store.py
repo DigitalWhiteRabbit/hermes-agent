@@ -14,6 +14,10 @@ class ProfileRoutingStoreUnavailable(RuntimeError):
     """The profile routing database could not complete an operation."""
 
 
+class ProfileBindingChanged(RuntimeError):
+    """The binding changed after it was read for authorization."""
+
+
 class ProfileRoutingStore:
     def __init__(
         self,
@@ -124,20 +128,7 @@ class ProfileRoutingStore:
         key = self._binding_scope(scope, scope_kind)
         try:
             with self._connection() as conn:
-                row = conn.execute(
-                    """
-                    SELECT * FROM profile_bindings
-                    WHERE platform = ? AND account_id = ? AND chat_id = ?
-                      AND scope_kind = ? AND thread_id = ?
-                    """,
-                    (
-                        key.platform,
-                        key.account_id,
-                        key.chat_id,
-                        scope_kind.value,
-                        self._sql_thread_id(key.thread_id),
-                    ),
-                ).fetchone()
+                row = self._select_binding(conn, key, scope_kind)
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
         if row is None:
@@ -159,55 +150,124 @@ class ProfileRoutingStore:
         scope_kind = ScopeKind(scope_kind)
         key = self._binding_scope(scope, scope_kind)
         now = self._clock()
-        values = (
-            key.platform,
-            key.account_id,
-            key.chat_id,
-            self._sql_thread_id(key.thread_id),
-            scope_kind.value,
-            profile_name,
-            created_by_user_id,
-            now,
-            now,
-            expires_at,
-        )
         try:
             with self._connection() as conn, self._immediate(conn):
-                conn.execute(
-                    """
-                    INSERT INTO profile_bindings (
-                        platform, account_id, chat_id, thread_id, scope_kind,
-                        profile_name, created_by_user_id, created_at, updated_at,
-                        expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(platform, account_id, chat_id, scope_kind, thread_id)
-                    DO UPDATE SET
-                        profile_name = excluded.profile_name,
-                        created_by_user_id = excluded.created_by_user_id,
-                        updated_at = excluded.updated_at,
-                        expires_at = excluded.expires_at,
-                        version = profile_bindings.version + 1
-                    """,
-                    values,
+                row = self._upsert_binding(
+                    conn,
+                    key,
+                    scope_kind,
+                    profile_name=profile_name,
+                    created_by_user_id=created_by_user_id,
+                    now=now,
+                    expires_at=expires_at,
                 )
-                row = conn.execute(
-                    """
-                    SELECT * FROM profile_bindings
-                    WHERE platform = ? AND account_id = ? AND chat_id = ?
-                      AND scope_kind = ? AND thread_id = ?
-                    """,
-                    (
-                        key.platform,
-                        key.account_id,
-                        key.chat_id,
-                        scope_kind.value,
-                        self._sql_thread_id(key.thread_id),
-                    ),
-                ).fetchone()
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
-        assert row is not None
         return self._binding_from_row(row)
+
+    def set_binding_with_audit(
+        self,
+        scope: ScopeKey,
+        scope_kind: ScopeKind,
+        *,
+        profile_name: str,
+        created_by_user_id: str,
+        source: str,
+        expires_at: float | None = None,
+    ) -> ProfileBinding:
+        scope_kind = ScopeKind(scope_kind)
+        key = self._binding_scope(scope, scope_kind)
+        now = self._clock()
+        try:
+            with self._connection() as conn, self._immediate(conn):
+                old_row = self._select_binding(conn, key, scope_kind)
+                row = self._upsert_binding(
+                    conn,
+                    key,
+                    scope_kind,
+                    profile_name=profile_name,
+                    created_by_user_id=created_by_user_id,
+                    now=now,
+                    expires_at=expires_at,
+                )
+                self._insert_audit(
+                    conn,
+                    actor_user_id=created_by_user_id,
+                    scope=scope,
+                    old_profile=(old_row["profile_name"] if old_row else None),
+                    new_profile=profile_name,
+                    scope_kind=scope_kind,
+                    source=source,
+                    result="allowed",
+                    reason_code=ReasonCode.ALLOWED,
+                )
+        except sqlite3.Error as exc:
+            raise self._unavailable(exc) from exc
+        return self._binding_from_row(row)
+
+    def _select_binding(
+        self,
+        conn: sqlite3.Connection,
+        key: ScopeKey,
+        scope_kind: ScopeKind,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """
+            SELECT * FROM profile_bindings
+            WHERE platform = ? AND account_id = ? AND chat_id = ?
+              AND scope_kind = ? AND thread_id = ?
+            """,
+            (
+                key.platform,
+                key.account_id,
+                key.chat_id,
+                scope_kind.value,
+                self._sql_thread_id(key.thread_id),
+            ),
+        ).fetchone()
+
+    def _upsert_binding(
+        self,
+        conn: sqlite3.Connection,
+        key: ScopeKey,
+        scope_kind: ScopeKind,
+        *,
+        profile_name: str,
+        created_by_user_id: str,
+        now: float,
+        expires_at: float | None,
+    ) -> sqlite3.Row:
+        conn.execute(
+            """
+            INSERT INTO profile_bindings (
+                platform, account_id, chat_id, thread_id, scope_kind,
+                profile_name, created_by_user_id, created_at, updated_at,
+                expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, account_id, chat_id, scope_kind, thread_id)
+            DO UPDATE SET
+                profile_name = excluded.profile_name,
+                created_by_user_id = excluded.created_by_user_id,
+                updated_at = excluded.updated_at,
+                expires_at = excluded.expires_at,
+                version = profile_bindings.version + 1
+            """,
+            (
+                key.platform,
+                key.account_id,
+                key.chat_id,
+                self._sql_thread_id(key.thread_id),
+                scope_kind.value,
+                profile_name,
+                created_by_user_id,
+                now,
+                now,
+                expires_at,
+            ),
+        )
+        row = self._select_binding(conn, key, scope_kind)
+        assert row is not None
+        return row
 
     def clear_binding(self, scope: ScopeKey, scope_kind: ScopeKind) -> bool:
         scope_kind = ScopeKind(scope_kind)
@@ -233,6 +293,78 @@ class ProfileRoutingStore:
             raise self._unavailable(exc) from exc
         return removed > 0
 
+    def clear_binding_with_audit(
+        self,
+        scope: ScopeKey,
+        scope_kind: ScopeKind,
+        *,
+        expected_version: int | None,
+        expected_profile: str | None,
+        actor_user_id: str,
+        source: str,
+    ) -> bool:
+        scope_kind = ScopeKind(scope_kind)
+        key = self._binding_scope(scope, scope_kind)
+        try:
+            with self._connection() as conn, self._immediate(conn):
+                row = self._select_binding(conn, key, scope_kind)
+                expired = (
+                    row is not None
+                    and row["expires_at"] is not None
+                    and float(row["expires_at"]) <= self._clock()
+                )
+                current_version = (
+                    int(row["version"]) if row is not None and not expired else None
+                )
+                current_profile = (
+                    str(row["profile_name"])
+                    if row is not None and not expired
+                    else None
+                )
+                if (current_version, current_profile) != (
+                    expected_version,
+                    expected_profile,
+                ):
+                    raise ProfileBindingChanged(
+                        "profile binding changed during authorized clear"
+                    )
+                removed = False
+                if row is not None:
+                    cursor = conn.execute(
+                        """
+                        DELETE FROM profile_bindings
+                        WHERE platform = ? AND account_id = ? AND chat_id = ?
+                          AND scope_kind = ? AND thread_id = ? AND version = ?
+                        """,
+                        (
+                            key.platform,
+                            key.account_id,
+                            key.chat_id,
+                            scope_kind.value,
+                            self._sql_thread_id(key.thread_id),
+                            int(row["version"]),
+                        ),
+                    )
+                    removed = cursor.rowcount > 0
+                    if not removed:
+                        raise ProfileBindingChanged(
+                            "profile binding changed during authorized clear"
+                        )
+                self._insert_audit(
+                    conn,
+                    actor_user_id=actor_user_id,
+                    scope=scope,
+                    old_profile=(row["profile_name"] if row else None),
+                    new_profile=None,
+                    scope_kind=scope_kind,
+                    source=source,
+                    result="allowed",
+                    reason_code=ReasonCode.ALLOWED,
+                )
+        except sqlite3.Error as exc:
+            raise self._unavailable(exc) from exc
+        return removed
+
     def set_once(
         self,
         scope: ScopeKey,
@@ -242,38 +374,94 @@ class ProfileRoutingStore:
         expires_at: float | None = None,
     ) -> ProfileBinding:
         now = self._clock()
-        values = (
-            scope.platform,
-            scope.account_id,
-            scope.chat_id,
-            self._sql_thread_id(scope.thread_id),
-            profile_name,
-            created_by_user_id,
-            now,
-            expires_at,
-        )
         try:
             with self._connection() as conn, self._immediate(conn):
-                conn.execute(
-                    """
-                    INSERT INTO profile_once (
-                        platform, account_id, chat_id, thread_id, profile_name,
-                        created_by_user_id, created_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(platform, account_id, chat_id, thread_id)
-                    DO UPDATE SET
-                        profile_name = excluded.profile_name,
-                        created_by_user_id = excluded.created_by_user_id,
-                        created_at = excluded.created_at,
-                        expires_at = excluded.expires_at
-                    """,
-                    values,
+                row = self._upsert_once(
+                    conn,
+                    scope,
+                    profile_name=profile_name,
+                    created_by_user_id=created_by_user_id,
+                    now=now,
+                    expires_at=expires_at,
                 )
-                row = self._select_once(conn, scope)
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
-        assert row is not None
         return self._binding_from_row(row, scope_kind=self._once_scope_kind(scope))
+
+    def set_once_with_audit(
+        self,
+        scope: ScopeKey,
+        *,
+        profile_name: str,
+        created_by_user_id: str,
+        source: str,
+        expires_at: float | None = None,
+    ) -> ProfileBinding:
+        now = self._clock()
+        scope_kind = self._once_scope_kind(scope)
+        try:
+            with self._connection() as conn, self._immediate(conn):
+                old_row = self._select_once(conn, scope)
+                row = self._upsert_once(
+                    conn,
+                    scope,
+                    profile_name=profile_name,
+                    created_by_user_id=created_by_user_id,
+                    now=now,
+                    expires_at=expires_at,
+                )
+                self._insert_audit(
+                    conn,
+                    actor_user_id=created_by_user_id,
+                    scope=scope,
+                    old_profile=(old_row["profile_name"] if old_row else None),
+                    new_profile=profile_name,
+                    scope_kind=scope_kind,
+                    source=source,
+                    result="allowed",
+                    reason_code=ReasonCode.ALLOWED,
+                )
+        except sqlite3.Error as exc:
+            raise self._unavailable(exc) from exc
+        return self._binding_from_row(row, scope_kind=scope_kind)
+
+    def _upsert_once(
+        self,
+        conn: sqlite3.Connection,
+        scope: ScopeKey,
+        *,
+        profile_name: str,
+        created_by_user_id: str,
+        now: float,
+        expires_at: float | None,
+    ) -> sqlite3.Row:
+        conn.execute(
+            """
+            INSERT INTO profile_once (
+                platform, account_id, chat_id, thread_id, profile_name,
+                created_by_user_id, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, account_id, chat_id, thread_id)
+            DO UPDATE SET
+                profile_name = excluded.profile_name,
+                created_by_user_id = excluded.created_by_user_id,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at
+            """,
+            (
+                scope.platform,
+                scope.account_id,
+                scope.chat_id,
+                self._sql_thread_id(scope.thread_id),
+                profile_name,
+                created_by_user_id,
+                now,
+                expires_at,
+            ),
+        )
+        row = self._select_once(conn, scope)
+        assert row is not None
+        return row
 
     def claim_once(self, scope: ScopeKey) -> ProfileBinding | None:
         try:
@@ -380,31 +568,56 @@ class ProfileRoutingStore:
     ) -> None:
         try:
             with self._connection() as conn, self._immediate(conn):
-                conn.execute(
-                    """
-                    INSERT INTO profile_switch_audit (
-                        created_at, actor_user_id, platform, account_id, chat_id,
-                        thread_id, old_profile, new_profile, scope_kind, source,
-                        result, reason_code
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        self._clock(),
-                        actor_user_id,
-                        scope.platform,
-                        scope.account_id,
-                        scope.chat_id,
-                        scope.thread_id,
-                        old_profile,
-                        new_profile,
-                        scope_kind.value if scope_kind is not None else None,
-                        source,
-                        result,
-                        reason_code.value,
-                    ),
+                self._insert_audit(
+                    conn,
+                    actor_user_id=actor_user_id,
+                    scope=scope,
+                    old_profile=old_profile,
+                    new_profile=new_profile,
+                    scope_kind=scope_kind,
+                    source=source,
+                    result=result,
+                    reason_code=reason_code,
                 )
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
+
+    def _insert_audit(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        actor_user_id: str,
+        scope: ScopeKey,
+        old_profile: str | None,
+        new_profile: str | None,
+        scope_kind: ScopeKind | None,
+        source: str,
+        result: str,
+        reason_code: ReasonCode,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO profile_switch_audit (
+                created_at, actor_user_id, platform, account_id, chat_id,
+                thread_id, old_profile, new_profile, scope_kind, source,
+                result, reason_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self._clock(),
+                actor_user_id,
+                scope.platform,
+                scope.account_id,
+                scope.chat_id,
+                scope.thread_id,
+                old_profile,
+                new_profile,
+                scope_kind.value if scope_kind is not None else None,
+                source,
+                result,
+                reason_code.value,
+            ),
+        )
 
     def prune(
         self,

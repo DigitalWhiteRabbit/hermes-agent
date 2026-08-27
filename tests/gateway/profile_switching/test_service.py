@@ -14,7 +14,10 @@ from gateway.profile_switching.service import (
     ProfileSwitchDenied,
     ProfileSwitchingService,
 )
-from gateway.profile_switching.store import ProfileRoutingStore
+from gateway.profile_switching.store import (
+    ProfileRoutingStore,
+    ProfileRoutingStoreUnavailable,
+)
 
 
 def _scope(thread_id: str | None = "thread-7") -> ScopeKey:
@@ -47,6 +50,19 @@ def _audit_rows(store: ProfileRoutingStore) -> list[sqlite3.Row]:
     with sqlite3.connect(store.path) as conn:
         conn.row_factory = sqlite3.Row
         return list(conn.execute("SELECT * FROM profile_switch_audit ORDER BY id"))
+
+
+def _reject_audit_inserts(store: ProfileRoutingStore) -> None:
+    with sqlite3.connect(store.path) as conn:
+        conn.execute(
+            """
+            CREATE TRIGGER reject_profile_switch_audit
+            BEFORE INSERT ON profile_switch_audit
+            BEGIN
+                SELECT RAISE(ABORT, 'injected audit failure');
+            END
+            """
+        )
 
 
 def test_set_profile_validates_before_write(tmp_path):
@@ -119,6 +135,31 @@ def test_set_profile_rejects_active_turn(tmp_path):
     assert audit[0]["reason_code"] == "active_turn"
 
 
+def test_clear_rejects_active_turn(tmp_path):
+    service, store = _service(tmp_path, "coder")
+    store.set_binding(
+        _scope(),
+        ScopeKind.THREAD,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+
+    with pytest.raises(ProfileSwitchBusy):
+        service.clear(
+            scope=_scope(),
+            scope_kind=ScopeKind.THREAD,
+            actor_user_id="user-1",
+            active_turn=True,
+        )
+
+    binding = store.get_binding(_scope(), ScopeKind.THREAD)
+    assert binding is not None and binding.profile_name == "coder"
+    audit = _audit_rows(store)
+    assert len(audit) == 1
+    assert audit[0]["result"] == "denied"
+    assert audit[0]["reason_code"] == "active_turn"
+
+
 def test_set_thread_requires_thread_id(tmp_path):
     service, store = _service(tmp_path, "coder")
 
@@ -157,6 +198,7 @@ def test_clear_only_removes_requested_dynamic_scope(tmp_path):
         scope=_scope(),
         scope_kind=ScopeKind.THREAD,
         actor_user_id="user-1",
+        active_turn=False,
     )
 
     assert store.get_binding(_scope(), ScopeKind.THREAD) is None
@@ -187,6 +229,145 @@ def test_set_once_does_not_replace_permanent_binding(tmp_path):
     assert claimed is not None and claimed.profile_name == "research"
 
 
+def test_set_once_audit_captures_replaced_one_shot(tmp_path):
+    service, store = _service(tmp_path, "coder", "research")
+    service.set_once(
+        scope=_scope(),
+        actor_user_id="user-1",
+        profile_name="research",
+        active_turn=False,
+    )
+
+    service.set_once(
+        scope=_scope(),
+        actor_user_id="user-1",
+        profile_name="coder",
+        active_turn=False,
+    )
+
+    audit = _audit_rows(store)
+    assert audit[1]["old_profile"] == "research"
+    assert audit[1]["new_profile"] == "coder"
+
+
+def test_set_profile_rolls_back_when_allowed_audit_insert_fails(tmp_path):
+    service, store = _service(tmp_path, "coder", "research")
+    store.set_binding(
+        _scope(),
+        ScopeKind.THREAD,
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    _reject_audit_inserts(store)
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        service.set_profile(
+            scope=_scope(),
+            scope_kind=ScopeKind.THREAD,
+            actor_user_id="user-1",
+            profile_name="coder",
+            active_turn=False,
+        )
+
+    binding = store.get_binding(_scope(), ScopeKind.THREAD)
+    assert binding is not None and binding.profile_name == "research"
+    assert binding.version == 1
+
+
+def test_set_once_rolls_back_when_allowed_audit_insert_fails(tmp_path):
+    service, store = _service(tmp_path, "coder", "research")
+    store.set_once(
+        _scope(),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    _reject_audit_inserts(store)
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        service.set_once(
+            scope=_scope(),
+            actor_user_id="user-1",
+            profile_name="coder",
+            active_turn=False,
+        )
+
+    once = store.claim_once(_scope())
+    assert once is not None and once.profile_name == "research"
+
+
+def test_clear_rolls_back_when_allowed_audit_insert_fails(tmp_path):
+    service, store = _service(tmp_path, "coder")
+    store.set_binding(
+        _scope(),
+        ScopeKind.THREAD,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    _reject_audit_inserts(store)
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        service.clear(
+            scope=_scope(),
+            scope_kind=ScopeKind.THREAD,
+            actor_user_id="user-1",
+            active_turn=False,
+        )
+
+    binding = store.get_binding(_scope(), ScopeKind.THREAD)
+    assert binding is not None and binding.profile_name == "coder"
+
+
+def test_clear_reauthorizes_binding_replaced_after_initial_read(tmp_path):
+    path = tmp_path / "routing.db"
+    replacement_store = ProfileRoutingStore(path)
+
+    class RacingStore(ProfileRoutingStore):
+        raced = False
+
+        def clear_binding_with_audit(self, *args, **kwargs):
+            if not self.raced:
+                self.raced = True
+                replacement_store.set_binding(
+                    _scope(),
+                    ScopeKind.THREAD,
+                    profile_name="research",
+                    created_by_user_id="user-2",
+                )
+            return super().clear_binding_with_audit(*args, **kwargs)
+
+    class RecordingPolicy:
+        def __init__(self):
+            self.profiles = []
+            self.delegate = _policy("coder", "research")
+
+        def evaluate(self, profile_name, scope, actor_user_id):
+            self.profiles.append(profile_name)
+            return self.delegate.evaluate(profile_name, scope, actor_user_id)
+
+    store = RacingStore(path)
+    store.set_binding(
+        _scope(),
+        ScopeKind.THREAD,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    policy = RecordingPolicy()
+    service = ProfileSwitchingService(store, policy)
+
+    assert service.clear(
+        scope=_scope(),
+        scope_kind=ScopeKind.THREAD,
+        actor_user_id="user-1",
+        active_turn=False,
+    )
+
+    assert policy.profiles == ["coder", "research"]
+    assert store.get_binding(_scope(), ScopeKind.THREAD) is None
+    audit = _audit_rows(store)
+    assert len(audit) == 1
+    assert audit[0]["old_profile"] == "research"
+
+
 def test_each_mutation_appends_redacted_audit(tmp_path):
     service, store = _service(tmp_path, "coder", "research")
 
@@ -207,6 +388,7 @@ def test_each_mutation_appends_redacted_audit(tmp_path):
         scope=_scope(),
         scope_kind=ScopeKind.THREAD,
         actor_user_id="user-1",
+        active_turn=False,
     )
 
     audit = _audit_rows(store)
