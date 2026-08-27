@@ -6212,6 +6212,7 @@ class BasePlatformAdapter(ABC):
                 # bindings must never cross into that account's namespace.
                 event.source.profile = owner_profile
                 event.source.transport_owner_profile = owner_profile
+                event.source.transport_platform = self.platform
             else:
                 resolve_profile = getattr(
                     runner,

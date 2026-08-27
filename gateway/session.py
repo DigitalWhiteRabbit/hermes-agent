@@ -224,6 +224,12 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+    # Platform/kind of the adapter that admitted this message. Relay ingress
+    # deliberately keeps the underlying platform in ``platform`` for session
+    # namespacing, so owner profile alone cannot recover the transport after a
+    # restart when both Relay and a native adapter are live. Appended after all
+    # pre-existing fields to preserve positional-constructor compatibility.
+    transport_platform: Optional[Platform] = None
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
@@ -234,6 +240,11 @@ class SessionSource:
             self.scope_id = self.guild_id
         elif self.scope_id is not None:
             self.guild_id = self.scope_id
+        # The authenticated relay socket is authoritative for live ingress.
+        # Persist its transport kind separately while retaining the underlying
+        # source platform for session keys and display/routing behavior.
+        if self.delivered_via_upstream_relay is True:
+            self.transport_platform = Platform.RELAY
 
     @property
     def description(self) -> str:
@@ -287,6 +298,8 @@ class SessionSource:
             d["profile"] = self.profile
         if self.transport_owner_profile:
             d["transport_owner_profile"] = self.transport_owner_profile
+        if self.transport_platform:
+            d["transport_platform"] = self.transport_platform.value
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -297,6 +310,15 @@ class SessionSource:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
+        transport_platform = None
+        if data.get("transport_platform"):
+            try:
+                transport_platform = Platform(data["transport_platform"])
+            except (TypeError, ValueError):
+                # Unknown provenance from a newer writer is non-authoritative;
+                # retain the legacy adapter lookup instead of rejecting the
+                # entire persisted session row.
+                transport_platform = None
         return cls(
             platform=Platform(data["platform"]),
             chat_id=str(data["chat_id"]),
@@ -315,6 +337,7 @@ class SessionSource:
             message_id=data.get("message_id"),
             profile=data.get("profile"),
             transport_owner_profile=data.get("transport_owner_profile"),
+            transport_platform=transport_platform,
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),

@@ -62,6 +62,7 @@ class TestSessionSourceRoundtrip:
             chat_id="12345",
             profile="coder",
             transport_owner_profile="default",
+            transport_platform=Platform.RELAY,
         )
 
         serialized = source.to_dict()
@@ -73,10 +74,13 @@ class TestSessionSourceRoundtrip:
         })
 
         assert serialized["transport_owner_profile"] == "default"
+        assert serialized["transport_platform"] == "relay"
         assert restored.profile == "coder"
         assert restored.transport_owner_profile == "default"
+        assert restored.transport_platform == Platform.RELAY
         assert legacy.profile == "coder"
         assert legacy.transport_owner_profile is None
+        assert legacy.transport_platform is None
 
 
 class TestSessionSourceDescription:
@@ -1658,6 +1662,7 @@ class TestGatewayRoutingTable:
         source = self._source()
         source.profile = "coder"
         source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
         entry = store.get_or_create_session(source)
 
         (tmp_path / "sessions.json").unlink()
@@ -1671,7 +1676,32 @@ class TestGatewayRoutingTable:
         assert restored is not None
         assert restored.profile == "coder"
         assert restored.transport_owner_profile == "default"
+        assert restored.transport_platform == Platform.RELAY
         restarted._db.close()
+
+    def test_dynamic_transport_provenance_survives_sessions_json_restart(
+        self, tmp_path
+    ):
+        config = GatewayConfig(multiplex_profiles=True)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        source = self._source()
+        source.platform = Platform.DISCORD
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+        entry = store.get_or_create_session(source)
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._db = None
+        restarted._ensure_loaded()
+        restored = restarted._entries[entry.session_key].origin
+
+        assert entry.session_key == "agent:coder:discord:dm:chat-1"
+        assert restored is not None
+        assert restored.profile == "coder"
+        assert restored.transport_owner_profile == "default"
+        assert restored.transport_platform == Platform.RELAY
 
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)

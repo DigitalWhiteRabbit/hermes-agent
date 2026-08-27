@@ -145,6 +145,22 @@ class GatewayAuthorizationMixin:
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
         transport_owner = getattr(source, "transport_owner_profile", None)
+        transport_platform = getattr(source, "transport_platform", None)
+        if isinstance(transport_platform, str):
+            try:
+                transport_platform = Platform(transport_platform)
+            except ValueError:
+                transport_platform = None
+        if transport_platform is not None:
+            owner_profile = (
+                transport_owner.strip()
+                if isinstance(transport_owner, str) and transport_owner.strip()
+                else None
+            )
+            return self._authorization_adapter(
+                transport_platform,
+                None if owner_profile in {None, "default"} else owner_profile,
+            )
         if isinstance(transport_owner, str) and transport_owner.strip():
             owner_profile = transport_owner.strip()
             return self._authorization_adapter(
@@ -417,6 +433,9 @@ class GatewayAuthorizationMixin:
             return True
 
         adapter_profile = self._adapter_profile_for_source(source)
+        authorization_platform = (
+            getattr(source, "transport_platform", None) or source.platform
+        )
 
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
@@ -448,7 +467,7 @@ class GatewayAuthorizationMixin:
         if allow_adapter_delegation and (
             source.delivered_via_upstream_relay is True
             or self._adapter_authorization_is_upstream(
-                source.platform,
+                authorization_platform,
                 profile=adapter_profile,
             )
         ):

@@ -745,6 +745,77 @@ async def test_dynamic_profile_auto_resume_uses_persisted_primary_owner():
     assert pending_entry.session_key == "agent:coder:telegram:dm:dynamic-chat"
 
 
+@pytest.mark.asyncio
+async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
+    tmp_path,
+    monkeypatch,
+):
+    runner, native = make_restart_runner()
+    _clear_names = (
+        "DISCORD_ALLOWED_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "DISCORD_ALLOW_ALL_USERS",
+    )
+    for name in _clear_names:
+        monkeypatch.delenv(name, raising=False)
+    relay = MagicMock(
+        authorization_is_upstream=True,
+        enforces_own_access_policy=False,
+    )
+    relay.handle_message = AsyncMock()
+    native.handle_message = AsyncMock()
+    runner.adapters = {
+        Platform.DISCORD: native,
+        Platform.RELAY: relay,
+    }
+    # Exercise the real restored-source authorization path, not the permissive
+    # lightweight runner seam installed by make_restart_runner().
+    del runner._is_user_authorized
+    persisted = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(multiplex_profiles=True),
+    )
+    persisted._db = None
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="relay-chat",
+        chat_type="dm",
+        user_id="u1",
+        profile="coder",
+        transport_owner_profile="default",
+        delivered_via_upstream_relay=True,
+    )
+    pending_entry = persisted.get_or_create_session(source)
+    assert persisted.mark_resume_pending(
+        pending_entry.session_key,
+        "restart_interrupted",
+    )
+
+    restarted = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(multiplex_profiles=True),
+    )
+    restarted._db = None
+    restarted._ensure_loaded()
+    runner.session_store = restarted
+    restored = restarted._entries[pending_entry.session_key].origin
+    assert restored is not None
+    assert restored.delivered_via_upstream_relay is False
+
+    assert runner._is_user_authorized(restored) is True
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    relay.handle_message.assert_awaited_once()
+    native.handle_message.assert_not_called()
+    resumed = relay.handle_message.await_args.args[0]
+    assert resumed.source.profile == "coder"
+    assert resumed.source.transport_platform == Platform.RELAY
+    assert pending_entry.session_key == "agent:coder:discord:dm:relay-chat"
+
+
 def test_legacy_resume_source_without_transport_owner_keeps_profile_lookup():
     runner, primary = make_restart_runner()
     secondary = object()
@@ -759,6 +830,7 @@ def test_legacy_resume_source_without_transport_owner_keeps_profile_lookup():
 
     assert runner._adapter_for_source(source) is secondary
     assert runner._adapter_for_source(make_restart_source()) is primary
+    assert source.transport_platform is None
 
 
 @pytest.mark.asyncio

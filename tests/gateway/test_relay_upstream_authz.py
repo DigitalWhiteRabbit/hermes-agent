@@ -135,7 +135,10 @@ def test_relay_message_with_underlying_discord_platform_authorized(monkeypatch):
     relay-delivery marker instead.
     """
     _clear_auth_env(monkeypatch)
-    runner, _ = _make_runner(platform=Platform.RELAY, authorization_is_upstream=True)
+    runner, relay = _make_runner(
+        platform=Platform.RELAY,
+        authorization_is_upstream=True,
+    )
     src = SessionSource(
         platform=Platform.DISCORD,  # underlying platform off the wire
         user_id="267171776755269633",
@@ -145,6 +148,8 @@ def test_relay_message_with_underlying_discord_platform_authorized(monkeypatch):
         delivered_via_upstream_relay=True,
     )
     assert runner._is_user_authorized(src) is True
+    assert src.transport_platform == Platform.RELAY
+    assert runner._adapter_for_source(src) is relay
 
 
 def test_event_from_wire_stamps_routed_profile():
@@ -171,5 +176,4 @@ def test_event_from_wire_stamps_routed_profile():
         }
     )
     assert event.source.profile == "reviewer"
-
 

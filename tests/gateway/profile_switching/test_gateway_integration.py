@@ -500,10 +500,22 @@ def _install_denied_static_service(
 @pytest.mark.parametrize("db_unavailable", [False, True])
 async def test_denied_static_is_not_reapplied_after_dynamic_resolution(
     tmp_path,
+    monkeypatch,
     denial,
     db_unavailable,
 ):
     runner, _store = _runner_with_store(tmp_path)
+    homes = _create_profile_homes()
+    for profile in ("default", "static"):
+        (homes[profile] / "config.yaml").write_text(
+            f"scope_probe: {profile}\n",
+            encoding="utf-8",
+        )
+        (homes[profile] / ".env").write_text(
+            f"PROFILE_ROUTING_SCOPE_PROBE={profile}\n",
+            encoding="utf-8",
+        )
+    monkeypatch.delenv("PROFILE_ROUTING_SCOPE_PROBE", raising=False)
     _install_denied_static_service(
         runner,
         tmp_path,
@@ -538,6 +550,58 @@ async def test_denied_static_is_not_reapplied_after_dynamic_resolution(
     await adapter.handle_message(event)
     assert captured_keys == ["agent:main:telegram:dm:chat-1"]
     assert event.source.profile is None
+
+    # Once dynamic policy rejects the static candidate, every later runtime
+    # lookup must honor that finalized default result. In particular, busy
+    # policy and both preprocessing/agent scopes must not re-run static routes.
+    runner._busy_input_mode = "interrupt"
+    runner._busy_input_modes_by_profile = {"static": "queue"}
+    assert runner._effective_busy_input_mode(event.source) == "interrupt"
+    assert runner._resolve_profile_home_for_source(event.source) == homes["default"]
+
+    def scope_snapshot() -> tuple[Path, str, str | None]:
+        from agent.secret_scope import get_secret
+        from gateway.run import _load_gateway_config
+
+        home = get_hermes_home()
+        return (
+            home,
+            _load_gateway_config().get("scope_probe"),
+            get_secret("PROFILE_ROUTING_SCOPE_PROBE"),
+        )
+
+    runtime_scopes: dict[str, tuple[Path, str, str | None]] = {}
+
+    async def capture_preprocessing(**_kwargs):
+        runtime_scopes["preprocessing"] = scope_snapshot()
+        return "prepared"
+
+    async def capture_agent(*_args, **_kwargs):
+        runtime_scopes["agent"] = scope_snapshot()
+        return {"final_response": "ok"}
+
+    runner._prepare_inbound_message_text = capture_preprocessing
+    runner._run_agent_inner = capture_agent
+    assert (
+        await runner._prepare_profile_scoped_inbound_message_text(
+            event=event,
+            source=event.source,
+            history=[],
+        )
+        == "prepared"
+    )
+    assert await runner._run_agent(
+        "hello",
+        "context",
+        [],
+        event.source,
+        "session-1",
+    ) == {"final_response": "ok"}
+    expected_scope = (homes["default"], "default", "default")
+    assert runtime_scopes == {
+        "preprocessing": expected_scope,
+        "agent": expected_scope,
+    }
 
     captured = await _dispatch_through_primary_wrapper(runner, event)
     assert captured["profile"] is None

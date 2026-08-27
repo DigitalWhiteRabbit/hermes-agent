@@ -7992,13 +7992,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         source.transport_owner_profile = "default"
-        source._dynamic_profile_resolved = True
+        source.transport_platform = (
+            Platform.RELAY
+            if getattr(source, "delivered_via_upstream_relay", False) is True
+            else getattr(source, "transport_platform", None) or source.platform
+        )
         source._profile_transport_account_id = self._profile_account_id_for_source(
             source
         )
         if event.internal:
             # Completion/background events stay in the profile captured by
             # their originating turn and never inspect or consume routing state.
+            source._dynamic_profile_resolved = True
             return
 
         static_profile = getattr(source, "profile", None)
@@ -8013,6 +8018,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 static_profile = self._profile_name_for_source(source)
             except ProfileRouteRejected:
                 source.profile_route_rejected = True
+
+        # Finalize only after a direct source has had its one permitted static
+        # candidate lookup. Every later lookup sees this marker and treats the
+        # dynamic result (including default/None) as authoritative.
+        source._dynamic_profile_resolved = True
 
         from gateway.profile_switching.models import ScopeKey
 
@@ -16298,6 +16308,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source = event.source
             source.profile = profile_name
             source.transport_owner_profile = profile_name
+            source.transport_platform = (
+                getattr(source, "transport_platform", None) or source.platform
+            )
             if profile_home is not None:
                 # Secondary credentials and runtime state remain in the same
                 # owner profile; shared primary bindings never enter this path.
@@ -16318,6 +16331,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if getattr(self, "_profile_switching_service", None) is not None:
                         event.source.profile = profile_name
                         event.source.transport_owner_profile = profile_name
+                        event.source.transport_platform = (
+                            getattr(event.source, "transport_platform", None)
+                            or event.source.platform
+                        )
                     elif not event.source.profile:
                         event.source.profile = profile_name
             except Exception:
@@ -16412,6 +16429,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if getattr(self, "_profile_switching_service", None) is not None:
                 source.profile = profile_name
                 source.transport_owner_profile = profile_name
+                source.transport_platform = (
+                    getattr(source, "transport_platform", None) or source.platform
+                )
             elif getattr(source, "profile", None) is None:
                 source.profile = profile_name
             if profile_home is not None:
@@ -28787,6 +28807,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
+            return None
+        if getattr(source, "_dynamic_profile_resolved", False):
             return None
         routes = getattr(config, "profile_routes", None)
         if not routes:
