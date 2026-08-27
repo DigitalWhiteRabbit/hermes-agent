@@ -6191,6 +6191,27 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        # Dynamic profile routing must precede this adapter-level busy/session
+        # key. Runner wrappers repeat the same helper after the guard as an
+        # idempotent safety net and preserve their transport authorization
+        # homes independently from the resolved runtime profile.
+        runner = getattr(self, "gateway_runner", None)
+        dynamic_service = (
+            vars(runner).get("_profile_switching_service")
+            if runner is not None
+            else None
+        )
+        if dynamic_service is not None:
+            resolve_profile = getattr(
+                runner,
+                "_resolve_dynamic_profile_for_event",
+                None,
+            )
+            if callable(resolve_profile):
+                resolution = resolve_profile(event)
+                if inspect.isawaitable(resolution):
+                    await resolution
+
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),

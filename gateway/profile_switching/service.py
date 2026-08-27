@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from hermes_cli.profiles import normalize_profile_name, validate_profile_name
 
 from .models import (
@@ -50,6 +52,33 @@ class ProfileSwitchingService:
         self._store = store
         self._policy = policy
         self._resolver = ProfileResolver(store, policy)
+
+    @classmethod
+    def from_gateway_config(
+        cls,
+        config,
+        *,
+        db_path: Path,
+    ) -> "ProfileSwitchingService":
+        """Build the routing service from the gateway's authoritative profiles."""
+        from gateway.run import _multiplex_profile_homes
+        from hermes_cli.profiles import list_profile_names, profile_exists
+
+        existing_profiles = {
+            name for name in list_profile_names() if profile_exists(name)
+        }
+        existing_profiles.add("default")
+        served_profiles = {
+            name for name, _home in _multiplex_profile_homes(config)
+        }
+        served_profiles.add("default")
+        store = ProfileRoutingStore(Path(db_path))
+        policy = ProfilePolicy(
+            config.profile_switching,
+            served_profiles=served_profiles,
+            existing_profiles=existing_profiles,
+        )
+        return cls(store, policy)
 
     @staticmethod
     def _profile_name(profile_name: str) -> str:

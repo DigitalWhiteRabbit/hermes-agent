@@ -6979,6 +6979,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self._profile_switching_service = None
+        if getattr(self.config.profile_switching, "enabled", False):
+            from gateway.profile_switching.service import ProfileSwitchingService
+
+            self._profile_switching_service = (
+                ProfileSwitchingService.from_gateway_config(
+                    self.config,
+                    db_path=get_hermes_home() / "state" / "profile-routing.db",
+                )
+            )
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -7955,6 +7965,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile,
         )
+
+    def _profile_account_id_for_source(self, source: SessionSource) -> str:
+        """Return the stable primary transport account for dynamic routing."""
+        platform = getattr(getattr(source, "platform", None), "value", "unknown")
+        return f"{platform}:primary"
+
+    async def _resolve_dynamic_profile_for_event(
+        self,
+        event: MessageEvent,
+    ) -> None:
+        """Resolve an event's runtime profile once, before session keying."""
+        service = getattr(self, "_profile_switching_service", None)
+        source = event.source
+        if service is None or getattr(source, "_dynamic_profile_resolved", False):
+            return
+
+        source._dynamic_profile_resolved = True
+        source._profile_transport_account_id = (
+            self._profile_account_id_for_source(source)
+        )
+        if event.internal:
+            # Completion/background events stay in the profile captured by
+            # their originating turn and never inspect or consume routing state.
+            return
+
+        from gateway.profile_switching.models import ScopeKey
+
+        scope = ScopeKey.from_source(
+            source,
+            account_id=source._profile_transport_account_id,
+        )
+        resolution = await asyncio.to_thread(
+            service.resolve,
+            scope=scope,
+            actor_user_id=str(source.user_id or ""),
+            consume_once=not bool(event.get_command()),
+            static_profile=getattr(source, "profile", None),
+        )
+        source._dynamic_profile_resolution_source = resolution.source.value
+        source.profile = resolution.profile_name
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -16212,8 +16262,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event.source.profile = profile_name
             except Exception:
                 pass
+            if getattr(self, "_profile_switching_service", None) is None:
+                if profile_home is not None:
+                    with _profile_runtime_scope(profile_home):
+                        return await self._handle_message(event)
+                return await self._handle_message(event)
+
+            source = event.source
             if profile_home is not None:
-                with _profile_runtime_scope(profile_home):
+                # The adapter credential owner remains the authorization
+                # identity even when a static/dynamic route selects a different
+                # runtime profile for config, sessions, memory, and secrets.
+                source._authorization_profile_home = profile_home
+            await self._resolve_dynamic_profile_for_event(event)
+            runtime_home = (
+                self._resolve_profile_home_for_source(source)
+                if getattr(source, "profile", None)
+                else profile_home
+            )
+            if runtime_home is not None:
+                with _profile_runtime_scope(runtime_home):
                     return await self._handle_message(event)
             return await self._handle_message(event)
 
@@ -16272,6 +16340,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # routing for the same source.
                     source.profile_route_rejected = True
 
+            await self._resolve_dynamic_profile_for_event(event)
             profile_home = (
                 self._resolve_profile_home_for_source(source)
                 if getattr(source, "profile", None)
@@ -17157,6 +17226,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reset_session_vars()
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
+
+        await self._resolve_dynamic_profile_for_event(event)
 
         # Most adapters resolve profile routes in build_source(), before they
         # hand us the event. A few internal/voice paths construct SessionSource
@@ -19488,7 +19559,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
                 source.chat_id, source.user_id, source.thread_id, recovered,
             )
-            source = dataclasses.replace(source, thread_id=recovered)
+            original_source = source
+            source = dataclasses.replace(original_source, thread_id=recovered)
+            # dataclasses.replace only carries declared fields. Preserve the
+            # in-process routing/auth provenance established at gateway ingress
+            # so session observation and any later authorization read keep the
+            # same transport identity after topic recovery.
+            for marker in (
+                "_authorization_profile_home",
+                "_dynamic_profile_resolved",
+                "_dynamic_profile_resolution_source",
+                "_profile_transport_account_id",
+            ):
+                if hasattr(original_source, marker):
+                    setattr(source, marker, getattr(original_source, marker))
             try:
                 event.source = source
             except Exception:
@@ -19536,6 +19620,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source,
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
+            service = getattr(self, "_profile_switching_service", None)
+            if service is not None:
+                from gateway.profile_switching.models import ScopeKey
+
+                try:
+                    await asyncio.to_thread(
+                        service.note_session,
+                        scope=ScopeKey.from_source(
+                            source,
+                            account_id=getattr(
+                                source,
+                                "_profile_transport_account_id",
+                                "default",
+                            ),
+                        ),
+                        profile_name=source.profile or "default",
+                        session_id=session_entry.session_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to record dynamic profile session observation",
+                        exc_info=True,
+                    )
         session_key = session_entry.session_key
         if not strict_session and pinned_session_id:
             resolved_entry = await self._resolve_async_delegation_session(
