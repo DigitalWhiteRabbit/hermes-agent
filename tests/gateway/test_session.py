@@ -1,6 +1,8 @@
 """Tests for gateway session management."""
 import json
 import pytest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1760,6 +1762,23 @@ class TestGatewayRoutingTable:
         assert persisted_json.origin is not None
         assert persisted_json.origin.transport_platform == second_transport
 
+        session_row = store._db.get_session(reused.session_id)
+        assert session_row is not None
+        session_origin = json.loads(session_row["origin_json"])
+        assert session_origin["transport_platform"] == second_transport.value
+        assert session_row["display_name"] == "Alice"
+        peer_lookup = store._db.find_latest_gateway_session_for_peer(
+            source="telegram",
+            user_id="user-1",
+            session_key=reused.session_key,
+            chat_id="chat-1",
+            chat_type="dm",
+        )
+        assert peer_lookup is not None
+        peer_origin = json.loads(peer_lookup["origin_json"])
+        assert peer_origin["transport_platform"] == second_transport.value
+        assert peer_lookup["display_name"] == "Alice"
+
         (tmp_path / "sessions.json").unlink()
         store._db.close()
         restarted = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1769,6 +1788,289 @@ class TestGatewayRoutingTable:
         assert persisted_db.origin is not None
         assert persisted_db.origin.transport_platform == second_transport
         restarted._db.close()
+
+    @pytest.mark.parametrize("touch_activity", [False, True])
+    @pytest.mark.parametrize(
+        ("first_transport", "final_transport"),
+        [
+            (Platform.TELEGRAM, Platform.RELAY),
+            (Platform.RELAY, Platform.TELEGRAM),
+        ],
+    )
+    def test_concurrent_reused_origin_refresh_keeps_all_durable_views_consistent(
+        self,
+        tmp_path,
+        touch_activity,
+        first_transport,
+        final_transport,
+    ):
+        """A completed later waiter must be the source in every durable view.
+
+        The two followers share one ``_SessionFlight``.  A reaches the peer
+        write first and is held there while B persists.  Before the fix, A's
+        unversioned peer write then lands last even though routing/live state
+        already contain B.  The coordination uses Events only; no scheduling
+        delay is part of the assertion.
+        """
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        def source(name, transport):
+            value = self._source()
+            value.profile = "coder"
+            value.chat_name = name
+            value.transport_owner_profile = "default"
+            value.transport_platform = transport
+            return value
+
+        owner_source = source("owner", first_transport)
+        source_a = source("native-A", first_transport)
+        source_b = source("relay-B", final_transport)
+
+        owner_in_impl = threading.Event()
+        release_owner = threading.Event()
+        a_peer_started = threading.Event()
+        release_a_peer = threading.Event()
+        b_waiter_released = threading.Event()
+        b_peer_finished = threading.Event()
+        follower_waiting = {"A": threading.Event(), "B": threading.Event()}
+        follower_label = threading.local()
+
+        original_impl = store._get_or_create_session_impl
+        original_record = store._record_gateway_session_peer
+
+        def blocked_impl(incoming, *args, **kwargs):
+            if incoming.chat_name == "owner":
+                owner_in_impl.set()
+                assert release_owner.wait(timeout=10)
+            return original_impl(incoming, *args, **kwargs)
+
+        def ordered_record(session_id, session_key, incoming, *args, **kwargs):
+            if incoming is not None and incoming.chat_name == "native-A":
+                a_peer_started.set()
+                assert release_a_peer.wait(timeout=10)
+            result = original_record(session_id, session_key, incoming, *args, **kwargs)
+            if incoming is not None and incoming.chat_name == "relay-B":
+                b_peer_finished.set()
+            return result
+
+        store._get_or_create_session_impl = blocked_impl  # type: ignore[method-assign]
+        store._record_gateway_session_peer = ordered_record  # type: ignore[method-assign]
+
+        def follower(label, incoming):
+            follower_label.value = label
+            return store.get_or_create_session(
+                incoming,
+                touch_activity=touch_activity,
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            owner_future = pool.submit(store.get_or_create_session, owner_source)
+            assert owner_in_impl.wait(timeout=10)
+            session_key = store._generate_session_key(owner_source)
+            with store._inflight_lock:
+                flight = store._inflight_sessions[session_key]
+            original_wait = flight.event.wait
+
+            def ordered_wait(*args, **kwargs):
+                label = follower_label.value
+                follower_waiting[label].set()
+                result = original_wait(*args, **kwargs)
+                if label == "B":
+                    assert a_peer_started.wait(timeout=10)
+                    b_waiter_released.set()
+                return result
+
+            flight.event.wait = ordered_wait  # type: ignore[method-assign]
+            a_future = pool.submit(follower, "A", source_a)
+            assert follower_waiting["A"].wait(timeout=10)
+            b_future = pool.submit(follower, "B", source_b)
+            assert follower_waiting["B"].wait(timeout=10)
+            release_owner.set()
+            assert a_peer_started.wait(timeout=10)
+            assert b_waiter_released.wait(timeout=10)
+
+            # On the buggy implementation B can reach its peer write while A
+            # is paused.  With the keyed serializer B is waiting behind A, so
+            # release A as soon as B has entered the refresh operation.
+            if hasattr(store, "_origin_refresh_registry"):
+                release_a_peer.set()
+            else:
+                assert b_peer_finished.wait(timeout=10)
+                release_a_peer.set()
+
+            owner = owner_future.result(timeout=10)
+            refreshed_a = a_future.result(timeout=10)
+            refreshed_b = b_future.result(timeout=10)
+
+        assert owner.session_id == refreshed_a.session_id == refreshed_b.session_id
+        live = store._entries[session_key]
+        assert live.origin is source_b
+        assert live.origin.transport_platform == final_transport
+        assert live.display_name == "relay-B"
+
+        sessions_json = json.loads((tmp_path / "sessions.json").read_text())
+        json_entry = SessionEntry.from_dict(sessions_json[session_key])
+        assert json_entry.origin is not None
+        assert json_entry.origin.transport_platform == final_transport
+        assert json_entry.display_name == "relay-B"
+
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing_entry = SessionEntry.from_dict(json.loads(routing_rows[session_key]))
+        assert routing_entry.origin is not None
+        assert routing_entry.origin.transport_platform == final_transport
+        assert routing_entry.display_name == "relay-B"
+
+        session_row = store._db.get_session(owner.session_id)
+        assert session_row is not None
+        session_origin = json.loads(session_row["origin_json"])
+        assert session_origin["transport_platform"] == final_transport.value
+        assert session_row["display_name"] == "relay-B"
+
+        peer_lookup = store._db.find_latest_gateway_session_for_peer(
+            source="telegram",
+            user_id="user-1",
+            session_key=session_key,
+            chat_id="chat-1",
+            chat_type="dm",
+        )
+        assert peer_lookup is not None
+        peer_origin = json.loads(peer_lookup["origin_json"])
+        assert peer_origin["transport_platform"] == final_transport.value
+        assert peer_lookup["display_name"] == "relay-B"
+
+    def test_adjacent_flight_cannot_overtake_old_origin_waiter(self, tmp_path):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        def source(name, transport):
+            value = self._source()
+            value.profile = "coder"
+            value.chat_name = name
+            value.transport_owner_profile = "default"
+            value.transport_platform = transport
+            return value
+
+        owner_source = source("owner", Platform.TELEGRAM)
+        waiter_source = source("old-waiter", Platform.TELEGRAM)
+        adjacent_source = source("adjacent-flight", Platform.RELAY)
+        owner_in_impl = threading.Event()
+        release_owner = threading.Event()
+        waiter_peer_started = threading.Event()
+        release_waiter_peer = threading.Event()
+        adjacent_impl_finished = threading.Event()
+        record_order = []
+
+        original_impl = store._get_or_create_session_impl
+        original_record = store._record_gateway_session_peer
+
+        def blocked_impl(incoming, *args, **kwargs):
+            if incoming.chat_name == "owner":
+                owner_in_impl.set()
+                assert release_owner.wait(timeout=10)
+            result = original_impl(incoming, *args, **kwargs)
+            if incoming.chat_name == "adjacent-flight":
+                adjacent_impl_finished.set()
+            return result
+
+        def ordered_record(session_id, session_key, incoming, *args, **kwargs):
+            if incoming is not None and incoming.chat_name == "old-waiter":
+                waiter_peer_started.set()
+                assert release_waiter_peer.wait(timeout=10)
+            result = original_record(session_id, session_key, incoming, *args, **kwargs)
+            if incoming is not None and incoming.chat_name in {
+                "old-waiter",
+                "adjacent-flight",
+            }:
+                record_order.append(incoming.chat_name)
+            return result
+
+        store._get_or_create_session_impl = blocked_impl  # type: ignore[method-assign]
+        store._record_gateway_session_peer = ordered_record  # type: ignore[method-assign]
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            owner_future = pool.submit(store.get_or_create_session, owner_source)
+            assert owner_in_impl.wait(timeout=10)
+            waiter_future = pool.submit(store.get_or_create_session, waiter_source)
+            release_owner.set()
+            owner = owner_future.result(timeout=10)
+            assert waiter_peer_started.wait(timeout=10)
+
+            # The owner future has completed its finally block, so the next
+            # call owns a new _SessionFlight while the old waiter is still in
+            # its provenance commit.
+            adjacent_future = pool.submit(
+                store.get_or_create_session,
+                adjacent_source,
+            )
+            assert adjacent_impl_finished.wait(timeout=10)
+            release_waiter_peer.set()
+            waiter = waiter_future.result(timeout=10)
+            adjacent = adjacent_future.result(timeout=10)
+
+        assert owner.session_id == waiter.session_id == adjacent.session_id
+        assert record_order == ["old-waiter", "adjacent-flight"]
+        assert adjacent.origin is adjacent_source
+        row = store._db.get_session(adjacent.session_id)
+        assert row is not None
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+
+    def test_blocked_origin_commit_for_one_key_does_not_block_another_key(
+        self, tmp_path
+    ):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source_a = self._source(chat_id="chat-A", user_id="user-A")
+        source_a.profile = "coder"
+        source_a.chat_name = "key-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        source_b = self._source(chat_id="chat-B", user_id="user-B")
+        source_b.profile = "coder"
+        source_b.chat_name = "key-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        a_at_persistence = threading.Event()
+        release_a = threading.Event()
+        b_at_persistence = threading.Event()
+        original_persist = store._persist_routing_data
+
+        def ordered_persist(data, generation):
+            names = {
+                item.get("display_name")
+                for key, item in data.items()
+                if not key.startswith("_")
+            }
+            if "key-A" in names and "key-B" not in names:
+                a_at_persistence.set()
+                assert release_a.wait(timeout=10)
+            if "key-B" in names:
+                b_at_persistence.set()
+            return original_persist(data, generation)
+
+        store._persist_routing_data = ordered_persist  # type: ignore[method-assign]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(store.get_or_create_session, source_a)
+            assert a_at_persistence.wait(timeout=10)
+            future_b = pool.submit(store.get_or_create_session, source_b)
+            assert b_at_persistence.wait(timeout=10)
+            release_a.set()
+            entry_a = future_a.result(timeout=10)
+            entry_b = future_b.result(timeout=10)
+
+        assert entry_a.session_key != entry_b.session_key
 
     def test_legacy_dynamic_session_backfills_transport_provenance(self, tmp_path):
         config = GatewayConfig(

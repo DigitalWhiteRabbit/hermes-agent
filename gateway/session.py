@@ -1251,6 +1251,14 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+@dataclass
+class _OriginRefreshLock:
+    """One ref-counted serialization boundary for a stable session key."""
+
+    lock: Any = field(default_factory=threading.Lock)
+    references: int = 0
+
+
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
@@ -1307,6 +1315,12 @@ class SessionStore:
         self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
+        # ``_SessionFlight`` ends when its owner publishes, before all waiters
+        # finish refreshing transport provenance.  This separate keyed
+        # registry therefore outlives a flight and orders the complete
+        # memory -> routing -> peer persistence sequence for one session.
+        self._origin_refresh_registry_lock = threading.Lock()
+        self._origin_refresh_registry: Dict[str, _OriginRefreshLock] = {}
         # An unscoped pre-migration Slack key can represent at most one
         # workspace. Claim it once per process so simultaneous first messages
         # from two workspaces cannot both revive the same legacy session.
@@ -1395,28 +1409,68 @@ class SessionStore:
         self,
         entry: SessionEntry,
         source: SessionSource,
+        *,
+        touch_activity: bool = False,
     ) -> None:
         """Durably refresh feature-on origin/provenance for every accepted turn."""
         if not self._transport_provenance_enabled():
             return
-        with self._lock:
-            current = self._entries.get(entry.session_key)
-            if current is None or current.session_id != entry.session_id:
-                return
-            current.origin = source
-            current.platform = source.platform
-            current.chat_type = source.chat_type
-            current.display_name = source.chat_name
-        # Origin affects both the primary routing row and the compatibility
-        # JSON mirror, so this is deliberately a structural save rather than
-        # the metadata-only single-row fast path.
-        self._save_entries()
-        self._record_gateway_session_peer(
-            entry.session_id,
-            entry.session_key,
-            source,
-            display_name=source.chat_name,
-        )
+        refresh_lock = self._acquire_origin_refresh_lock(entry.session_key)
+        try:
+            with self._lock:
+                current = self._entries.get(entry.session_key)
+                if current is None or current.session_id != entry.session_id:
+                    return
+                current.origin = source
+                current.platform = source.platform
+                current.chat_type = source.chat_type
+                current.display_name = source.chat_name
+                if touch_activity:
+                    current.updated_at = _now()
+                # Capture the structural routing view and peer payload from
+                # the same accepted source while the live entry is stable.
+                routing_data, routing_generation = self._snapshot_routing_locked()
+                peer_session_id = current.session_id
+                peer_display_name = current.display_name
+
+            # Never hold SessionStore._lock (or either registry guard) across
+            # SQLite / fsync.  The keyed lock alone preserves source ordering
+            # through both durable stores.
+            self._persist_routing_data(routing_data, routing_generation)
+            self._record_gateway_session_peer(
+                peer_session_id,
+                entry.session_key,
+                source,
+                display_name=peer_display_name,
+            )
+        finally:
+            self._release_origin_refresh_lock(entry.session_key, refresh_lock)
+
+    def _acquire_origin_refresh_lock(self, session_key: str) -> _OriginRefreshLock:
+        """Acquire the keyed provenance serializer without holding its guard."""
+        with self._origin_refresh_registry_lock:
+            keyed = self._origin_refresh_registry.get(session_key)
+            if keyed is None:
+                keyed = _OriginRefreshLock()
+                self._origin_refresh_registry[session_key] = keyed
+            keyed.references += 1
+        keyed.lock.acquire()
+        return keyed
+
+    def _release_origin_refresh_lock(
+        self,
+        session_key: str,
+        keyed: _OriginRefreshLock,
+    ) -> None:
+        """Release and remove an unused keyed provenance serializer."""
+        keyed.lock.release()
+        with self._origin_refresh_registry_lock:
+            keyed.references -= 1
+            if (
+                keyed.references == 0
+                and self._origin_refresh_registry.get(session_key) is keyed
+            ):
+                self._origin_refresh_registry.pop(session_key, None)
 
     def _open_session_db_for_active_scope(self):
         """Return the SessionDB for the profile scope active on this task.
@@ -2740,8 +2794,12 @@ class SessionStore:
             if slot.error is not None:
                 raise slot.error
             assert slot.result is not None
-            self._refresh_dynamic_origin_for_turn(slot.result, source)
-            if touch_activity:
+            self._refresh_dynamic_origin_for_turn(
+                slot.result,
+                source,
+                touch_activity=touch_activity,
+            )
+            if touch_activity and not self._transport_provenance_enabled():
                 self.update_session(slot.result.session_key)
             return slot.result
 

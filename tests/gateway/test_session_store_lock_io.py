@@ -16,7 +16,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, SessionResetPolicy
+from gateway.config import (
+    GatewayConfig,
+    Platform,
+    ProfileSwitchingConfig,
+    SessionResetPolicy,
+)
 from gateway.session import SessionEntry, SessionSource, SessionStore
 
 
@@ -165,6 +170,42 @@ class TestSaveOutsideLock:
             f"while lock was held"
         )
 
+    def test_dynamic_origin_persistence_not_holding_lock(self, tmp_path):
+        """Routing JSON/SQLite and peer SQLite stay outside the store lock."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._lock = _TrackedLock()
+        source = _source()
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+
+        calls_under_lock = []
+        original_persist = store._persist_routing_data
+        original_record = store._record_gateway_session_peer
+
+        def tracking_persist(data, generation):
+            if store._lock.held:
+                calls_under_lock.append("routing")
+            return original_persist(data, generation)
+
+        def tracking_record(*args, **kwargs):
+            if store._lock.held:
+                calls_under_lock.append("peer")
+            return original_record(*args, **kwargs)
+
+        store._persist_routing_data = tracking_persist  # type: ignore[method-assign]
+        store._record_gateway_session_peer = tracking_record  # type: ignore[method-assign]
+
+        store.get_or_create_session(source)
+
+        assert calls_under_lock == []
+
 
 class TestRecoverOutsideLock:
     def test_recover_not_holding_lock(self, tmp_path):
@@ -252,5 +293,4 @@ def test_auto_reset_does_not_recover_session_being_ended(tmp_path):
         old.session_id, "suspended"
     )
     db.end_session.assert_not_called()
-
 
