@@ -42,6 +42,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
+from contextlib import nullcontext
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -17708,60 +17709,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
         elif not self._is_user_authorized_for_source(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if (
-                source.chat_type == "dm"
-                and self._get_unauthorized_dm_behavior(
-                    source.platform,
-                    profile=source.profile,
-                )
-                == "pair"
-            ):
-                platform_name = source.platform.value if source.platform else "unknown"
-                pairing_store = self._pairing_store_for(source)
-                if pairing_store is None:
-                    logger.error(
-                        "Cannot offer pairing code on %s: no pairing store",
-                        platform_name,
+            authorization_home = getattr(
+                source,
+                "_authorization_profile_home",
+                None,
+            )
+            authorization_scope = (
+                _profile_runtime_scope(Path(authorization_home))
+                if authorization_home is not None
+                else nullcontext()
+            )
+            with authorization_scope:
+                # In DMs: offer pairing code. In groups: silently ignore.
+                if (
+                    source.chat_type == "dm"
+                    and self._get_unauthorized_dm_behavior(
+                        source.platform,
+                        profile=self._authorization_profile_for_source(source),
                     )
-                    return None
-                # Rate-limit ALL pairing responses (code or rejection) to
-                # prevent spamming the user with repeated messages when
-                # multiple DMs arrive in quick succession.
-                if pairing_store._is_rate_limited(platform_name, source.user_id):
-                    return None
-                code = pairing_store.generate_code(
-                    platform_name, source.user_id, source.user_name or ""
-                )
-                if code:
-                    adapter = self._adapter_for_source(source)
-                    if adapter:
-                        store_profile = getattr(pairing_store, "profile", None)
-                        profile_arg = (
-                            f"-p {store_profile} "
-                            if isinstance(store_profile, str)
-                            and store_profile
-                            and store_profile != "default"
-                            else ""
+                    == "pair"
+                ):
+                    platform_name = source.platform.value if source.platform else "unknown"
+                    pairing_store = self._pairing_store_for(source)
+                    if pairing_store is None:
+                        logger.error(
+                            "Cannot offer pairing code on %s: no pairing store",
+                            platform_name,
                         )
-                        await adapter.send(
-                            source.chat_id,
-                            f"Hi~ I don't recognize you yet!\n\n"
-                            f"Here's your pairing code: `{code}`\n\n"
-                            f"Ask the bot owner to run:\n"
-                            f"`hermes {profile_arg}pairing approve "
-                            f"{platform_name} {code}`"
-                        )
-                else:
-                    adapter = self._adapter_for_source(source)
-                    if adapter:
-                        await adapter.send(
-                            source.chat_id,
-                            "Too many pairing requests right now~ "
-                            "Please try again later!"
-                        )
-                    # Record rate limit so subsequent messages are silently ignored
-                    pairing_store._record_rate_limit(platform_name, source.user_id)
+                        return None
+                    # Rate-limit ALL pairing responses (code or rejection) to
+                    # prevent spamming the user with repeated messages when
+                    # multiple DMs arrive in quick succession.
+                    if pairing_store._is_rate_limited(platform_name, source.user_id):
+                        return None
+                    code = pairing_store.generate_code(
+                        platform_name, source.user_id, source.user_name or ""
+                    )
+                    if code:
+                        adapter = self._adapter_for_source(source)
+                        if adapter:
+                            store_profile = getattr(pairing_store, "profile", None)
+                            profile_arg = (
+                                f"-p {store_profile} "
+                                if isinstance(store_profile, str)
+                                and store_profile
+                                and store_profile != "default"
+                                else ""
+                            )
+                            await adapter.send(
+                                source.chat_id,
+                                f"Hi~ I don't recognize you yet!\n\n"
+                                f"Here's your pairing code: `{code}`\n\n"
+                                f"Ask the bot owner to run:\n"
+                                f"`hermes {profile_arg}pairing approve "
+                                f"{platform_name} {code}`"
+                            )
+                    else:
+                        adapter = self._adapter_for_source(source)
+                        if adapter:
+                            await adapter.send(
+                                source.chat_id,
+                                "Too many pairing requests right now~ "
+                                "Please try again later!"
+                            )
+                        # Record rate limit so subsequent messages are silently ignored
+                        pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
         # Global emergency stop (`hermes pause`): give new turns a brief

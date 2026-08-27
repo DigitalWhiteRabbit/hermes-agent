@@ -42,6 +42,46 @@ class _StubAdapter(BasePlatformAdapter):
 _StubAdapter.__abstractmethods__ = frozenset()  # type: ignore[attr-defined]
 
 
+class _PairingStoreProbe:
+    def __init__(
+        self,
+        *approvals: bool,
+        profile: str | None = None,
+        code: str | None = None,
+    ) -> None:
+        self.profile = profile
+        self._approvals = list(approvals)
+        self._code = code
+        self.approval_calls: list[tuple[str, str, Path]] = []
+        self.rate_limit_calls: list[tuple[str, str, Path]] = []
+        self.record_rate_limit_calls: list[tuple[str, str, Path]] = []
+        self.code_calls: list[tuple[str, str, str, Path]] = []
+
+    def is_approved(self, platform: str, user_id: str) -> bool:
+        self.approval_calls.append((platform, user_id, get_hermes_home()))
+        return self._approvals.pop(0) if self._approvals else False
+
+    def _is_rate_limited(self, platform: str, user_id: str) -> bool:
+        self.rate_limit_calls.append((platform, user_id, get_hermes_home()))
+        return False
+
+    def _record_rate_limit(self, platform: str, user_id: str) -> None:
+        self.record_rate_limit_calls.append(
+            (platform, user_id, get_hermes_home())
+        )
+
+    def generate_code(
+        self,
+        platform: str,
+        user_id: str,
+        user_name: str,
+    ) -> str | None:
+        self.code_calls.append(
+            (platform, user_id, user_name, get_hermes_home())
+        )
+        return self._code
+
+
 def _profile_switching_config(*, enabled: bool = True) -> ProfileSwitchingConfig:
     return ProfileSwitchingConfig(
         enabled=enabled,
@@ -445,6 +485,241 @@ async def test_primary_adapter_resolves_before_busy_session_key(tmp_path):
     await adapter.handle_message(event)
 
     assert captured_keys == ["agent:research:telegram:dm:chat-1"]
+
+
+@pytest.mark.asyncio
+async def test_primary_pairing_identity_is_stable_after_dynamic_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    runner, store = _runner_with_store(tmp_path)
+    event = _event(runner)
+    store.set_once(
+        _scope(event),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    primary_store = _PairingStoreProbe(True, True, True, profile="default")
+    research_store = _PairingStoreProbe(False, profile="research")
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"research": research_store}
+    runner._is_user_authorized_for_source = (
+        GatewayRunner._is_user_authorized_for_source.__get__(runner)
+    )
+    monkeypatch.setattr("gateway.authz_mixin._auth_env", lambda *_args: "")
+    monkeypatch.setattr(
+        "gateway.authz_mixin._platform_gate_env",
+        lambda _name, default="": default,
+    )
+
+    assert runner._primary_transport_allows_dynamic_routing(event) is True
+    await runner._resolve_dynamic_profile_for_event(event)
+
+    assert event.source.profile == "research"
+    assert runner._session_key_for_source(event.source) == (
+        "agent:research:telegram:dm:chat-1"
+    )
+    assert runner._is_user_authorized_for_source(event.source) is True
+    assert store.claim_once(_scope(event)) is None
+    assert len(primary_store.approval_calls) == 3
+    assert research_store.approval_calls == []
+
+
+@pytest.mark.asyncio
+async def test_primary_denial_cannot_consume_route_approved_by_runtime_store(
+    tmp_path,
+    monkeypatch,
+):
+    runner, store = _runner_with_store(tmp_path)
+    event = _event(runner)
+    store.set_once(
+        _scope(event),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    primary_store = _PairingStoreProbe(False, profile="default")
+    research_store = _PairingStoreProbe(True, profile="research")
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"research": research_store}
+    runner._is_user_authorized_for_source = (
+        GatewayRunner._is_user_authorized_for_source.__get__(runner)
+    )
+    monkeypatch.setattr("gateway.authz_mixin._auth_env", lambda *_args: "")
+    monkeypatch.setattr(
+        "gateway.authz_mixin._platform_gate_env",
+        lambda _name, default="": default,
+    )
+
+    await runner._resolve_dynamic_profile_for_event(event)
+
+    assert event.source.profile is None
+    assert event.source._dynamic_profile_resolution_source == "default"
+    assert store.claim_once(_scope(event)).profile_name == "research"
+    assert len(primary_store.approval_calls) == 1
+    assert research_store.approval_calls == []
+
+
+def test_pairing_store_transport_owner_isolated_from_runtime_profile(tmp_path):
+    runner, _store = _runner_with_store(tmp_path)
+    primary_store = _PairingStoreProbe(profile="default")
+    research_store = _PairingStoreProbe(profile="research")
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"research": research_store}
+
+    primary_routed = _event(runner).source
+    primary_routed.profile = "research"
+    primary_routed.transport_owner_profile = "default"
+    secondary_owned = _event(runner).source
+    secondary_owned.profile = "research"
+    secondary_owned.transport_owner_profile = "research"
+
+    assert runner._pairing_store_for(primary_routed) is primary_store
+    assert runner._pairing_store_for(secondary_owned) is research_store
+
+    runner.pairing_stores = {}
+    assert runner._pairing_store_for(secondary_owned) is None
+
+
+def test_pairing_store_transport_owner_feature_off_uses_runtime_profile(tmp_path):
+    runner, _store = _runner_with_store(tmp_path)
+    runner.config = _gateway_config(enabled=False)
+    primary_store = _PairingStoreProbe(profile="default")
+    research_store = _PairingStoreProbe(profile="research")
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"research": research_store}
+    source = _event(runner).source
+    source.profile = "research"
+    source.transport_owner_profile = "default"
+
+    assert runner._pairing_store_for(source) is research_store
+
+    runner.config.profile_switching = SimpleNamespace(enabled=1)
+    assert runner._pairing_store_for(source) is research_store
+
+
+def test_secondary_transport_uses_only_its_pairing_approval_and_policy(
+    tmp_path,
+    monkeypatch,
+):
+    runner, _store = _runner_with_store(tmp_path)
+    primary_adapter = _StubAdapter(
+        PlatformConfig(enabled=True),
+        Platform.TELEGRAM,
+    )
+    primary_adapter._dm_policy = "pairing"
+    research_adapter = _StubAdapter(
+        PlatformConfig(enabled=True),
+        Platform.TELEGRAM,
+    )
+    research_adapter.gateway_runner = runner
+    research_adapter.set_owner_profile("research")
+    research_adapter._dm_policy = "disabled"
+    runner.adapters = {Platform.TELEGRAM: primary_adapter}
+    runner._profile_adapters = {
+        "research": {Platform.TELEGRAM: research_adapter},
+    }
+    source = research_adapter.build_source(
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="user-1",
+    )
+    source.profile = "research"
+    primary_store = _PairingStoreProbe(True, profile="default")
+    research_store = _PairingStoreProbe(False, True, profile="research")
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"research": research_store}
+    runner._is_user_authorized_for_source = (
+        GatewayRunner._is_user_authorized_for_source.__get__(runner)
+    )
+    monkeypatch.setattr("gateway.authz_mixin._auth_env", lambda *_args: "")
+    monkeypatch.setattr(
+        "gateway.authz_mixin._platform_gate_env",
+        lambda _name, default="": default,
+    )
+
+    assert runner._is_user_authorized_for_source(source) is False
+    assert runner._is_user_authorized_for_source(source) is True
+    assert primary_store.approval_calls == []
+    assert len(research_store.approval_calls) == 2
+    assert runner._get_unauthorized_dm_behavior(
+        source.platform,
+        profile=runner._authorization_profile_for_source(source),
+    ) == "ignore"
+
+
+@pytest.mark.asyncio
+async def test_primary_canonical_pairing_uses_transport_policy_store_and_home(
+    tmp_path,
+    monkeypatch,
+):
+    runner, store = _runner_with_store(tmp_path)
+    homes = _create_profile_homes()
+    primary_adapter = _StubAdapter(
+        PlatformConfig(enabled=True, extra={"dm_policy": "pairing"}),
+        Platform.TELEGRAM,
+    )
+    primary_adapter.gateway_runner = runner
+    primary_adapter._dm_policy = "pairing"
+    primary_adapter.send = AsyncMock()
+    research_adapter = _StubAdapter(
+        PlatformConfig(enabled=True, extra={"dm_policy": "disabled"}),
+        Platform.TELEGRAM,
+    )
+    research_adapter._dm_policy = "disabled"
+    runner.adapters = {Platform.TELEGRAM: primary_adapter}
+    runner._profile_adapters = {
+        "research": {Platform.TELEGRAM: research_adapter},
+    }
+    event = MessageEvent(
+        text="hello",
+        source=primary_adapter.build_source(
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+    store.set_once(
+        _scope(event),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    primary_store = _PairingStoreProbe(
+        True,
+        False,
+        profile="default",
+        code="PRIMARY-CODE",
+    )
+    research_store = _PairingStoreProbe(False, profile="research")
+    runner.pairing_store = primary_store
+    runner.pairing_stores = {"research": research_store}
+    runner._is_user_authorized_for_source = (
+        GatewayRunner._is_user_authorized_for_source.__get__(runner)
+    )
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    monkeypatch.setattr("gateway.authz_mixin._auth_env", lambda *_args: "")
+    monkeypatch.setattr(
+        "gateway.authz_mixin._platform_gate_env",
+        lambda _name, default="": default,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda *_args, **_kwargs: [],
+    )
+
+    result = await runner._make_default_profile_message_handler()(event)
+
+    assert result is None
+    assert event.source.profile == "research"
+    assert len(primary_store.approval_calls) == 2
+    assert research_store.approval_calls == []
+    assert primary_store.rate_limit_calls == [
+        ("telegram", "user-1", homes["default"]),
+    ]
+    assert primary_store.code_calls == [
+        ("telegram", "user-1", "", homes["default"]),
+    ]
+    primary_adapter.send.assert_awaited_once()
+    assert "PRIMARY-CODE" in primary_adapter.send.await_args.args[1]
 
 
 @pytest.mark.asyncio

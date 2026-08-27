@@ -243,6 +243,20 @@ class GatewayAuthorizationMixin:
                 return None if owner_profile == "default" else owner_profile
         return getattr(source, "profile", None)
 
+    def _authorization_profile_for_source(
+        self,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Return the profile that owns ingress authorization for *source*.
+
+        Dynamic routing changes ``source.profile`` to select runtime/session
+        state, but it must not change the bot account's pairing or intake
+        policy.  Keep legacy runtime-profile selection when the feature is off.
+        """
+        if self._profile_switching_provenance_enabled():
+            return self._adapter_profile_for_source(source)
+        return getattr(source, "profile", None)
+
     def _adapter_authorization_is_upstream(
         self,
         platform: Optional[Platform],
@@ -421,16 +435,20 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the PairingStore owned by the source's ingress transport.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        Feature-on routing separates runtime identity from transport ownership:
+        the primary/default transport uses the global store even after routing,
+        while named secondary transports require their own store and fail
+        closed when it is absent. Feature-off keeps the historical runtime-
+        profile lookup and global fallback.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
+        profile = self._authorization_profile_for_source(source)
+        if self._profile_switching_provenance_enabled():
+            if profile in {None, "default"}:
+                return getattr(self, "pairing_store", None)
+            return per_profile.get(profile)
         if profile and profile in per_profile:
             return per_profile[profile]
         return getattr(self, "pairing_store", None)
