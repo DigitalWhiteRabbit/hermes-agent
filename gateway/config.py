@@ -922,6 +922,205 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
 }
 
 
+@dataclass(frozen=True)
+class ProfileSwitchRule:
+    profile: str
+    users: tuple[str, ...] = ()
+    chats: tuple[str, ...] = ()
+    threads: tuple[str, ...] = ()
+    require_confirmation: bool = False
+
+
+@dataclass(frozen=True)
+class ProfileSwitchingConfig:
+    enabled: bool = False
+    picker_ttl_seconds: int = 300
+    audit_retention_days: int = 30
+    audit_max_rows: int = 10_000
+    default_visible: tuple[str, ...] = ()
+    hidden: tuple[str, ...] = ()
+    admins: Dict[str, tuple[str, ...]] = field(default_factory=dict)
+    rules: tuple[ProfileSwitchRule, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "picker_ttl_seconds": self.picker_ttl_seconds,
+            "audit_retention_days": self.audit_retention_days,
+            "audit_max_rows": self.audit_max_rows,
+            "default_visible": list(self.default_visible),
+            "hidden": list(self.hidden),
+            "admins": {key: list(value) for key, value in self.admins.items()},
+            "rules": [asdict(rule) for rule in self.rules],
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: Any,
+        *,
+        multiplex_profiles: bool,
+        multiplex_profile_allowlist: Optional[List[str]],
+    ) -> "ProfileSwitchingConfig":
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError("profile_switching must be a mapping")
+
+        allowed_keys = {
+            "enabled",
+            "picker_ttl_seconds",
+            "audit_retention_days",
+            "audit_max_rows",
+            "default_visible",
+            "hidden",
+            "admins",
+            "rules",
+        }
+        unknown_keys = set(raw) - allowed_keys
+        if unknown_keys:
+            raise ValueError(
+                f"unknown profile_switching keys: {sorted(unknown_keys)}"
+            )
+
+        def positive_int(key: str, default: int) -> int:
+            if key not in raw:
+                return default
+            value = raw[key]
+            if isinstance(value, bool):
+                raise ValueError(f"profile_switching.{key} must be a positive integer")
+            if isinstance(value, int):
+                parsed = value
+            elif isinstance(value, str):
+                token = value.strip()
+                if not token or not token.isascii() or not token.isdecimal():
+                    raise ValueError(
+                        f"profile_switching.{key} must be a positive integer"
+                    )
+                parsed = int(token, 10)
+            else:
+                raise ValueError(f"profile_switching.{key} must be a positive integer")
+            if parsed <= 0:
+                raise ValueError(f"profile_switching.{key} must be a positive integer")
+            return parsed
+
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        def profile_names(key: str) -> tuple[str, ...]:
+            values = raw.get(key, ())
+            if not isinstance(values, (list, tuple)):
+                raise ValueError(f"profile_switching.{key} must be a list")
+            normalized = []
+            seen = set()
+            for value in values:
+                name = normalize_profile_name(value)
+                validate_profile_name(name)
+                if name not in seen:
+                    normalized.append(name)
+                    seen.add(name)
+            return tuple(normalized)
+
+        def id_list(value: Any, key: str) -> tuple[str, ...]:
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"{key} must be a list")
+            normalized = []
+            for item in value:
+                if isinstance(item, (dict, list, tuple, set)) or item is None:
+                    raise ValueError(f"{key} contains an invalid ID")
+                normalized.append(str(item))
+            return tuple(normalized)
+
+        admins_raw = raw.get("admins", {})
+        if not isinstance(admins_raw, dict):
+            raise ValueError("profile_switching.admins must be a mapping")
+        admins = {
+            str(platform): id_list(
+                ids, f"profile_switching.admins.{platform}"
+            )
+            for platform, ids in admins_raw.items()
+        }
+
+        rule_allowed_keys = {
+            "profile",
+            "users",
+            "chats",
+            "threads",
+            "require_confirmation",
+        }
+        rules_raw = raw.get("rules", ())
+        if not isinstance(rules_raw, (list, tuple)):
+            raise ValueError("profile_switching.rules must be a list")
+        rules = []
+        for index, rule_raw in enumerate(rules_raw):
+            if not isinstance(rule_raw, dict):
+                raise ValueError(f"profile_switching.rules[{index}] must be a mapping")
+            rule_unknown_keys = set(rule_raw) - rule_allowed_keys
+            if rule_unknown_keys:
+                raise ValueError(
+                    "unknown profile_switching rule keys: "
+                    f"{sorted(rule_unknown_keys)}"
+                )
+            if "profile" not in rule_raw:
+                raise ValueError(
+                    f"profile_switching.rules[{index}].profile is required"
+                )
+            profile = normalize_profile_name(rule_raw["profile"])
+            validate_profile_name(profile)
+            rules.append(
+                ProfileSwitchRule(
+                    profile=profile,
+                    users=id_list(
+                        rule_raw.get("users", ()),
+                        f"profile_switching.rules[{index}].users",
+                    ),
+                    chats=id_list(
+                        rule_raw.get("chats", ()),
+                        f"profile_switching.rules[{index}].chats",
+                    ),
+                    threads=id_list(
+                        rule_raw.get("threads", ()),
+                        f"profile_switching.rules[{index}].threads",
+                    ),
+                    require_confirmation=_coerce_bool(
+                        rule_raw.get("require_confirmation"), False
+                    ),
+                )
+            )
+
+        enabled = _coerce_bool(raw.get("enabled"), False)
+        default_visible = profile_names("default_visible")
+        hidden = profile_names("hidden")
+        overlap = set(default_visible) & set(hidden)
+        if overlap:
+            raise ValueError(
+                "profile_switching profiles cannot be both visible and hidden: "
+                f"{sorted(overlap)}"
+            )
+        if enabled and not multiplex_profiles:
+            raise ValueError(
+                "profile_switching.enabled requires gateway.multiplex_profiles"
+            )
+        if multiplex_profile_allowlist is not None:
+            served_profiles = {"default", *multiplex_profile_allowlist}
+            unserved = set(default_visible) - served_profiles
+            if unserved:
+                raise ValueError(
+                    "profile_switching default_visible profiles are not served: "
+                    f"{sorted(unserved)}"
+                )
+
+        return cls(
+            enabled=enabled,
+            picker_ttl_seconds=positive_int("picker_ttl_seconds", 300),
+            audit_retention_days=positive_int("audit_retention_days", 30),
+            audit_max_rows=positive_int("audit_max_rows", 10_000),
+            default_visible=default_visible,
+            hidden=hidden,
+            admins=admins,
+            rules=tuple(rules),
+        )
+
+
 @dataclass
 class GatewayConfig:
     """
@@ -981,7 +1180,6 @@ class GatewayConfig:
     # Optional named-profile allowlist for multiplex mode. None preserves the
     # historical serve-all behavior; [] serves only the default profile.
     multiplex_profile_allowlist: Optional[List[str]] = None
-
     # Opt-in systemd event-loop watchdog. Zero preserves Type=simple and
     # disables sd_notify at runtime.
     systemd_watchdog_seconds: int = 0
@@ -1028,6 +1226,11 @@ class GatewayConfig:
     # different profiles. See gateway/profile_routing.py. Each entry is a
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
+
+    # Typed opt-in policy for dynamic profile switching.
+    profile_switching: ProfileSwitchingConfig = field(
+        default_factory=ProfileSwitchingConfig
+    )
 
     def __post_init__(self) -> None:
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
@@ -1148,6 +1351,7 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
+            "profile_switching": self.profile_switching.to_dict(),
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "loop_watchdog_probe_interval_s": self.loop_watchdog_probe_interval_s,
@@ -1284,6 +1488,19 @@ class GatewayConfig:
         env_multiplex = _env_multiplex_profiles_override()
         if env_multiplex is not None:
             multiplex_profiles = env_multiplex
+        multiplex_profiles = _coerce_bool(multiplex_profiles, False)
+        multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
+            multiplex_profile_allowlist
+        )
+        if "profile_switching" in data:
+            profile_switching_raw = data.get("profile_switching")
+        else:
+            profile_switching_raw = nested_gateway.get("profile_switching")
+        profile_switching = ProfileSwitchingConfig.from_dict(
+            profile_switching_raw,
+            multiplex_profiles=multiplex_profiles,
+            multiplex_profile_allowlist=multiplex_profile_allowlist,
+        )
         if "max_concurrent_sessions" in data:
             max_concurrent_raw = data.get("max_concurrent_sessions")
             max_concurrent_key = "max_concurrent_sessions"
@@ -1326,8 +1543,9 @@ class GatewayConfig:
             stt_echo_transcripts=_coerce_bool(stt_echo_transcripts, True),
             group_sessions_per_user=_coerce_bool(group_sessions_per_user, True),
             thread_sessions_per_user=_coerce_bool(thread_sessions_per_user, False),
-            multiplex_profiles=_coerce_bool(multiplex_profiles, False),
+            multiplex_profiles=multiplex_profiles,
             multiplex_profile_allowlist=multiplex_profile_allowlist,
+            profile_switching=profile_switching,
             systemd_watchdog_seconds=systemd_watchdog_seconds,
             loop_watchdog=loop_watchdog,
             loop_watchdog_probe_interval_s=loop_watchdog_probe_interval_s,
@@ -1485,6 +1703,14 @@ def load_gateway_config() -> GatewayConfig:
                 gw_data["multiplex_profile_allowlist"] = gateway_section[
                     "multiplex_profile_allowlist"
                 ]
+
+            if "profile_switching" in yaml_cfg:
+                gw_data["profile_switching"] = yaml_cfg["profile_switching"]
+            elif (
+                isinstance(gateway_section, dict)
+                and "profile_switching" in gateway_section
+            ):
+                gw_data["profile_switching"] = gateway_section["profile_switching"]
 
             # Profile-based routing rules: accept either top-level
             # ``profile_routes`` or the nested ``gateway.profile_routes`` form
