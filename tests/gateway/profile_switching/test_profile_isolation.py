@@ -16,16 +16,17 @@ from agent.prompt_builder import (
 from gateway.config import (
     GatewayConfig,
     Platform,
+    PlatformConfig,
     ProfileSwitchRule,
     ProfileSwitchingConfig,
 )
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 from gateway.profile_switching.models import ScopeKey, ScopeKind
 from gateway.profile_switching.policy import ProfilePolicy
 from gateway.profile_switching.service import ProfileSwitchingService
 from gateway.profile_switching.store import ProfileRoutingStore
 from gateway.run import GatewayRunner, _profile_runtime_scope
-from gateway.session import SessionSource, SessionStore
+from gateway.session import SessionStore
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 from hermes_cli.env_loader import reset_secret_source_cache
@@ -42,6 +43,13 @@ _NAMED_PROFILES = tuple(name for name in _PROFILE_SENTINELS if name != "default"
 _ACTOR_ID = "user-1"
 
 
+class _StubAdapter(BasePlatformAdapter):
+    pass
+
+
+_StubAdapter.__abstractmethods__ = frozenset()  # type: ignore[attr-defined]
+
+
 @dataclass(frozen=True)
 class _ProfileFixture:
     root: Path
@@ -51,7 +59,7 @@ class _ProfileFixture:
     service: ProfileSwitchingService
     store: ProfileRoutingStore
     scope: ScopeKey
-    primary_adapter: object
+    primary_adapter: _StubAdapter
 
 
 @dataclass(frozen=True)
@@ -65,6 +73,23 @@ class _RuntimeSnapshot:
     credential: str | None
     workspace: Path
     workspace_marker: str
+
+
+@dataclass(frozen=True)
+class _ContextIdentity:
+    home: Path
+    config_sentinel: str
+    credential: str | None
+    soul: str | None
+
+
+@dataclass(frozen=True)
+class _ContextRestoration:
+    outer_before_inner: _ContextIdentity
+    inner: _ContextIdentity
+    outer_after_inner: _ContextIdentity
+    after_outer_home: Path
+    after_outer_secret_scope: object | None
 
 
 def _policy(*, allowed_profiles: tuple[str, ...]) -> ProfilePolicy:
@@ -174,7 +199,11 @@ def profile_fixture(tmp_path, monkeypatch):
     runner = object.__new__(GatewayRunner)
     runner.config = config
     runner._profile_switching_service = service
-    primary_adapter = object()
+    primary_adapter = _StubAdapter(
+        PlatformConfig(enabled=True),
+        Platform.TELEGRAM,
+    )
+    primary_adapter.gateway_runner = runner
     runner.adapters = {Platform.TELEGRAM: primary_adapter}
     runner._profile_adapters = {}
     scope = ScopeKey("telegram", "telegram:primary", "chat-1", None)
@@ -209,8 +238,7 @@ def _set_chat_profile(fixture: _ProfileFixture, profile: str) -> None:
 async def _resolve_next_turn(fixture: _ProfileFixture) -> MessageEvent:
     event = MessageEvent(
         text="profile isolation probe",
-        source=SessionSource(
-            platform=Platform.TELEGRAM,
+        source=fixture.primary_adapter.build_source(
             chat_id="chat-1",
             chat_type="dm",
             user_id=_ACTOR_ID,
@@ -220,31 +248,66 @@ async def _resolve_next_turn(fixture: _ProfileFixture) -> MessageEvent:
     return event
 
 
-def _runtime_snapshot(home: Path) -> _RuntimeSnapshot:
+def _runtime_snapshot() -> _RuntimeSnapshot:
     from agent.secret_scope import get_secret
     from gateway.run import _load_gateway_config
 
-    with _profile_runtime_scope(home):
-        config = load_config()
-        gateway_config = _load_gateway_config()
-        memory = MemoryStore()
-        memory.load_from_disk()
-        workspace = Path(config["terminal"]["cwd"])
-        return _RuntimeSnapshot(
-            home=get_hermes_home(),
-            config_sentinel=config["profile_probe"]["sentinel"],
-            gateway_config_sentinel=gateway_config["profile_probe"]["sentinel"],
-            soul=load_soul_md(),
-            memory_entries=tuple(memory.memory_entries),
-            skills_prompt=build_skills_system_prompt(
-                skills_dir_override=home / "skills"
-            ),
-            credential=get_secret("PROFILE_API_KEY"),
-            workspace=workspace,
-            workspace_marker=(workspace / "profile.txt").read_text(
-                encoding="utf-8"
-            ).strip(),
-        )
+    home = get_hermes_home()
+    config = load_config()
+    gateway_config = _load_gateway_config()
+    memory = MemoryStore()
+    memory.load_from_disk()
+    workspace = Path(config["terminal"]["cwd"])
+    return _RuntimeSnapshot(
+        home=home,
+        config_sentinel=config["profile_probe"]["sentinel"],
+        gateway_config_sentinel=gateway_config["profile_probe"]["sentinel"],
+        soul=load_soul_md(),
+        memory_entries=tuple(memory.memory_entries),
+        skills_prompt=build_skills_system_prompt(
+            skills_dir_override=home / "skills"
+        ),
+        credential=get_secret("PROFILE_API_KEY"),
+        workspace=workspace,
+        workspace_marker=(workspace / "profile.txt").read_text(
+            encoding="utf-8"
+        ).strip(),
+    )
+
+
+async def _capture_next_primary_turn(
+    fixture: _ProfileFixture,
+) -> tuple[MessageEvent, _RuntimeSnapshot]:
+    event = MessageEvent(
+        text="profile isolation probe",
+        source=fixture.primary_adapter.build_source(
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id=_ACTOR_ID,
+        ),
+    )
+    captured: _RuntimeSnapshot | None = None
+
+    async def capture(_event: MessageEvent):
+        nonlocal captured
+        captured = _runtime_snapshot()
+
+    fixture.runner._handle_message = capture
+    await fixture.runner._make_default_profile_message_handler()(event)
+    assert captured is not None
+    return event, captured
+
+
+def _context_identity() -> _ContextIdentity:
+    from agent.secret_scope import get_secret
+
+    config = load_config()
+    return _ContextIdentity(
+        home=get_hermes_home(),
+        config_sentinel=config["profile_probe"]["sentinel"],
+        credential=get_secret("PROFILE_API_KEY"),
+        soul=load_soul_md(),
+    )
 
 
 @pytest.mark.asyncio
@@ -276,12 +339,8 @@ async def test_runtime_scope_reads_only_selected_profile_config(profile_fixture)
     snapshots: dict[str, _RuntimeSnapshot] = {}
     for profile in ("coder", "copywriter"):
         _set_chat_profile(profile_fixture, profile)
-        event = await _resolve_next_turn(profile_fixture)
+        event, snapshots[profile] = await _capture_next_primary_turn(profile_fixture)
         assert event.source.profile == profile
-        resolved_home = profile_fixture.runner._resolve_profile_home_for_source(
-            event.source
-        )
-        snapshots[profile] = _runtime_snapshot(resolved_home)
 
     for profile, snapshot in snapshots.items():
         sentinel = _PROFILE_SENTINELS[profile]
@@ -379,25 +438,28 @@ async def test_return_to_profile_reuses_its_own_session_only(profile_fixture):
 async def test_concurrent_coder_and_copywriter_turns_restore_contextvars(
     profile_fixture,
 ):
-    from agent.secret_scope import current_secret_scope, get_secret
+    from agent.secret_scope import current_secret_scope
 
     entered = {profile: asyncio.Event() for profile in ("coder", "copywriter")}
     release = asyncio.Event()
 
     async def concurrent_turn(profile: str):
         home = profile_fixture.homes[profile]
-        sentinel = _PROFILE_SENTINELS[profile]
-        with _profile_runtime_scope(home):
-            entered[profile].set()
-            await release.wait()
-            config = load_config()
-            await asyncio.sleep(0)
-            return (
-                get_hermes_home(),
-                config["profile_probe"]["sentinel"],
-                get_secret("PROFILE_API_KEY"),
-                load_soul_md(),
-            )
+        with _profile_runtime_scope(profile_fixture.root):
+            outer_before_inner = _context_identity()
+            with _profile_runtime_scope(home):
+                entered[profile].set()
+                await release.wait()
+                await asyncio.sleep(0)
+                inner = _context_identity()
+            outer_after_inner = _context_identity()
+        return _ContextRestoration(
+            outer_before_inner=outer_before_inner,
+            inner=inner,
+            outer_after_inner=outer_after_inner,
+            after_outer_home=get_hermes_home(),
+            after_outer_secret_scope=current_secret_scope(),
+        )
 
     coder_task = asyncio.create_task(concurrent_turn("coder"))
     copywriter_task = asyncio.create_task(concurrent_turn("copywriter"))
@@ -408,18 +470,33 @@ async def test_concurrent_coder_and_copywriter_turns_restore_contextvars(
     release.set()
     coder, copywriter = await asyncio.gather(coder_task, copywriter_task)
 
-    assert coder == (
+    default_identity = _ContextIdentity(
+        profile_fixture.root,
+        "DEFAULT_SENTINEL",
+        "DEFAULT_SENTINEL_API_KEY",
+        "DEFAULT_SENTINEL_SOUL",
+    )
+    assert coder.outer_before_inner == default_identity
+    assert coder.inner == _ContextIdentity(
         profile_fixture.homes["coder"],
         "CODER_SENTINEL",
         "CODER_SENTINEL_API_KEY",
         "CODER_SENTINEL_SOUL",
     )
-    assert copywriter == (
+    assert coder.outer_after_inner == default_identity
+    assert coder.after_outer_home == profile_fixture.root
+    assert coder.after_outer_secret_scope is None
+
+    assert copywriter.outer_before_inner == default_identity
+    assert copywriter.inner == _ContextIdentity(
         profile_fixture.homes["copywriter"],
         "COPYWRITER_SENTINEL",
         "COPYWRITER_SENTINEL_API_KEY",
         "COPYWRITER_SENTINEL_SOUL",
     )
+    assert copywriter.outer_after_inner == default_identity
+    assert copywriter.after_outer_home == profile_fixture.root
+    assert copywriter.after_outer_secret_scope is None
     assert get_hermes_home() == profile_fixture.root
     assert current_secret_scope() is None
 
