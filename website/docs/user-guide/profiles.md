@@ -186,6 +186,93 @@ assistant gateway install     # creates hermes-gateway-assistant service
 
 Each profile gets its own service name. They run independently.
 
+## Experimental dynamic routing core (Milestone 1)
+
+Milestone 1 adds an opt-in routing core for serving several non-sensitive
+profiles through one primary gateway account. It provides policy checks,
+durable chat/thread bindings, one-shot routing state, audit records, and
+profile-aware session isolation. It does **not** provide end-user chat controls:
+`/profile set`, picker callbacks, and command aliases arrive in Milestone 2.
+The only mutation surface in this milestone is the Python
+`ProfileSwitchingService` API used by the test suite.
+
+Create and configure the `coder`, `copywriter`, and `research` profiles first,
+then add this exact block to the default profile's `config.yaml` (normally
+`~/.hermes/config.yaml`):
+
+```yaml
+gateway:
+  multiplex_profiles: true
+  multiplex_profile_allowlist:
+    - coder
+    - copywriter
+    - research
+  profile_switching:
+    enabled: true
+    default_visible: [default, coder, copywriter, research]
+    hidden: [finance, security, production]
+    admins:
+      telegram: [123456789]
+    rules:
+      - profile: default
+        users: [123456789]
+        chats: ["*"]
+      - profile: coder
+        users: [123456789]
+        chats: ["*"]
+      - profile: copywriter
+        users: [123456789]
+        chats: ["*"]
+      - profile: research
+        users: [123456789]
+        chats: ["*"]
+```
+
+Replace `123456789` with the authorized Telegram user ID. The four visible
+profiles are the only profiles served by this gateway configuration. The
+`finance`, `security`, and `production` names are intentionally hidden and
+unserved here: sensitive profiles must use separate bot tokens and separate
+gateways, not this shared primary account.
+
+Dynamic bindings belong to the primary account namespace
+`<platform>:primary` (for example, `telegram:primary`). A bot owned by a
+secondary profile is a distinct transport account and skips the shared dynamic
+resolver; messages received by that bot stay in its owner profile. Resolution
+on the primary account is deterministic: an eligible one-shot binding wins,
+then a thread binding, then a chat binding, then the existing static profile
+route. With no match, Hermes uses the normal default route. Recognized slash
+commands do not consume a pending one-shot binding; the next ordinary message
+does. Milestone 1 has no chat command for creating any of these bindings.
+
+The selected runtime profile controls the agent home, session key, model,
+memory, config, and credentials for that turn. It does not change which bot
+received the message or which transport authorization applies. Hermes records
+that durable transport provenance separately as `transport_owner_profile` and
+`transport_platform`; operators should not edit those internal session fields.
+
+### Storage, backup, and retention
+
+When this feature is enabled, the default/primary gateway creates the SQLite
+database at `$HERMES_HOME/state/profile-routing.db` (normally
+`~/.hermes/state/profile-routing.db`). The database stores routing scope IDs,
+profile names, session IDs, policy outcomes, timestamps, and hashed picker
+nonces. It never stores message text, bot tokens, API keys, or other secrets.
+
+Milestone 1 does not create a separate automatic backup for this database.
+Include it in the normal backup of the default profile. For a consistent manual
+copy, stop the gateway before copying `profile-routing.db`; if the gateway must
+remain online, use SQLite's backup mechanism rather than copying only the main
+file while WAL writes may be active.
+
+The configuration schema reserves `audit_retention_days` (default `30`) and
+`audit_max_rows` (default `10000`), and the store supports transactional
+pruning. Milestone 1 does not yet schedule that pruning automatically, so apply
+an operator-managed retention process if audit-volume limits are required.
+
+Setting `gateway.profile_switching.enabled: false` (the default) leaves the
+existing static routes unchanged, does not initialize the switching service,
+and does not create `state/profile-routing.db`.
+
 :::note Inside the official Docker image
 Per-profile gateways are supervised by [s6-overlay](https://github.com/just-containers/s6-overlay) (PID 1 in the container), so `hermes profile create <name>` automatically registers an s6 service slot at `/run/service/gateway-<name>/`. `hermes -p <name> gateway start/stop/restart` dispatches to `s6-svc` instead of spawning a bare process — crashes are auto-restarted and `docker restart` preserves the previously-running set of gateways. See [Per-profile gateway supervision](/user-guide/docker#per-profile-gateway-supervision) for details.
 :::
