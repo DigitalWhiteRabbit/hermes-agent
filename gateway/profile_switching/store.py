@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .migrations import run_migrations
 from .models import ProfileBinding, ReasonCode, ScopeKey, ScopeKind
+
+
+logger = logging.getLogger(__name__)
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_BUSY_TIMEOUT_MS = 250
 
 
 class ProfileRoutingStoreUnavailable(RuntimeError):
@@ -27,26 +34,103 @@ class ProfileRoutingStore:
     ) -> None:
         self.path = Path(path)
         self._clock = clock
+        self.quarantined_paths: tuple[Path, ...] = ()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connection() as conn:
-                run_migrations(conn)
-        except (OSError, sqlite3.Error) as exc:
+            if self._has_invalid_sqlite_header():
+                self.quarantined_paths = self._quarantine_corrupt_files()
+            self._initialize_schema()
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            if self._is_corruption_error(exc) and self.path.exists():
+                try:
+                    self.quarantined_paths = self._quarantine_corrupt_files()
+                    self._initialize_schema()
+                    logger.error(
+                        "Quarantined corrupt profile routing database and "
+                        "initialized a replacement: %s",
+                        self.path,
+                    )
+                    return
+                except (OSError, sqlite3.Error, TypeError, ValueError) as retry_exc:
+                    exc = retry_exc
             raise ProfileRoutingStoreUnavailable(
                 f"profile routing database is unavailable: {self.path}"
             ) from exc
 
+    def _initialize_schema(self) -> None:
+        with self._connection() as conn:
+            run_migrations(conn)
+
+    def _has_invalid_sqlite_header(self) -> bool:
+        try:
+            if not self.path.is_file() or self.path.stat().st_size == 0:
+                return False
+            with self.path.open("rb") as handle:
+                return handle.read(len(_SQLITE_HEADER)) != _SQLITE_HEADER
+        except OSError:
+            return False
+
+    @staticmethod
+    def _is_corruption_error(exc: BaseException) -> bool:
+        if isinstance(exc, (TypeError, ValueError)):
+            # During initialization these arise only while decoding persisted
+            # schema metadata (for example a non-integer schema version).
+            return True
+        code = getattr(exc, "sqlite_errorcode", None)
+        corrupt_codes = {
+            getattr(sqlite3, "SQLITE_CORRUPT", -1),
+            getattr(sqlite3, "SQLITE_NOTADB", -2),
+        }
+        if code in corrupt_codes:
+            return True
+        message = str(exc).lower()
+        return any(
+            token in message
+            for token in (
+                "database disk image is malformed",
+                "file is not a database",
+                "malformed database schema",
+            )
+        )
+
+    def _quarantine_corrupt_files(self) -> tuple[Path, ...]:
+        """Recoverably rename the DB and sidecars; never delete them."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        moved: list[Path] = []
+        for candidate in (
+            self.path,
+            Path(f"{self.path}-wal"),
+            Path(f"{self.path}-shm"),
+        ):
+            if not candidate.exists():
+                continue
+            destination = candidate.with_name(f"{candidate.name}.corrupt-{stamp}")
+            suffix = 1
+            while destination.exists():
+                destination = candidate.with_name(
+                    f"{candidate.name}.corrupt-{stamp}-{suffix}"
+                )
+                suffix += 1
+            candidate.replace(destination)
+            moved.append(destination)
+        if moved:
+            logger.error(
+                "Quarantined corrupt profile routing artifacts: %s",
+                ", ".join(str(item) for item in moved),
+            )
+        return tuple(moved)
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
             self.path,
-            timeout=5.0,
+            timeout=_BUSY_TIMEOUT_MS / 1000,
             isolation_level=None,
             check_same_thread=False,
         )
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys=ON")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
             except sqlite3.DatabaseError:
@@ -109,6 +193,17 @@ class ProfileRoutingStore:
             version=int(row["version"]) if "version" in row.keys() else 1,
         )
 
+    def _decode_binding(
+        self,
+        row: sqlite3.Row,
+        *,
+        scope_kind: ScopeKind | None = None,
+    ) -> ProfileBinding:
+        try:
+            return self._binding_from_row(row, scope_kind=scope_kind)
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
+            raise self._unavailable(exc) from exc
+
     @contextmanager
     def _immediate(self, conn: sqlite3.Connection) -> Iterator[None]:
         conn.execute("BEGIN IMMEDIATE")
@@ -133,7 +228,7 @@ class ProfileRoutingStore:
             raise self._unavailable(exc) from exc
         if row is None:
             return None
-        binding = self._binding_from_row(row)
+        binding = self._decode_binding(row)
         if binding.expires_at is not None and binding.expires_at <= self._clock():
             return None
         return binding
@@ -163,7 +258,7 @@ class ProfileRoutingStore:
                 )
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
-        return self._binding_from_row(row)
+        return self._decode_binding(row)
 
     def set_binding_with_audit(
         self,
@@ -203,7 +298,7 @@ class ProfileRoutingStore:
                 )
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
-        return self._binding_from_row(row)
+        return self._decode_binding(row)
 
     def _select_binding(
         self,
@@ -386,7 +481,7 @@ class ProfileRoutingStore:
                 )
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
-        return self._binding_from_row(row, scope_kind=self._once_scope_kind(scope))
+        return self._decode_binding(row, scope_kind=self._once_scope_kind(scope))
 
     def set_once_with_audit(
         self,
@@ -423,7 +518,7 @@ class ProfileRoutingStore:
                 )
         except sqlite3.Error as exc:
             raise self._unavailable(exc) from exc
-        return self._binding_from_row(row, scope_kind=scope_kind)
+        return self._decode_binding(row, scope_kind=scope_kind)
 
     def _upsert_once(
         self,
@@ -479,7 +574,7 @@ class ProfileRoutingStore:
             raise self._unavailable(exc) from exc
         if row is None:
             return None
-        binding = self._binding_from_row(row, scope_kind=self._once_scope_kind(scope))
+        binding = self._decode_binding(row, scope_kind=self._once_scope_kind(scope))
         if binding.expires_at is not None and binding.expires_at <= self._clock():
             return None
         return binding
@@ -653,7 +748,7 @@ class ProfileRoutingStore:
             raise self._unavailable(exc) from exc
         return audit_removed, nonces_removed
 
-    def _unavailable(self, exc: sqlite3.Error) -> ProfileRoutingStoreUnavailable:
+    def _unavailable(self, exc: BaseException) -> ProfileRoutingStoreUnavailable:
         return ProfileRoutingStoreUnavailable(
             f"profile routing database is unavailable: {self.path}"
         )

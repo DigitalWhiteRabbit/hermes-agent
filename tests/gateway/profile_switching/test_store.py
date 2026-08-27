@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from pathlib import Path
 
 import pytest
 
@@ -61,7 +62,103 @@ def test_migration_creates_schema_and_enables_foreign_keys(tmp_path):
     assert version == str(LATEST_SCHEMA_VERSION)
     with closing(store._connect()) as conn:
         assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 250
+
+
+def test_corrupt_database_and_sidecars_are_quarantined_before_recovery(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    original = b"not a sqlite database"
+    path.write_bytes(original)
+    Path(f"{path}-wal").write_bytes(b"wal")
+    Path(f"{path}-shm").write_bytes(b"shm")
+
+    store = ProfileRoutingStore(path)
+
+    assert store.quarantined_paths
+    assert {item.read_bytes() for item in store.quarantined_paths} == {
+        original,
+        b"wal",
+        b"shm",
+    }
+    assert path.exists()
+    with sqlite3.connect(path) as conn:
+        assert (
+            conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            is not None
+        )
+
+
+def test_malformed_schema_version_is_quarantined_and_rebuilt(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    ProfileRoutingStore(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE schema_meta SET value = 'not-an-integer' "
+            "WHERE key = 'schema_version'"
+        )
+
+    recovered = ProfileRoutingStore(path)
+
+    assert recovered.quarantined_paths
+    assert any(
+        item.name.startswith("profile-routing.db.corrupt-")
+        for item in recovered.quarantined_paths
+    )
+
+
+def test_locked_database_is_unavailable_without_quarantine(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    ProfileRoutingStore(path)
+    blocker = sqlite3.connect(path, isolation_level=None)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises(ProfileRoutingStoreUnavailable):
+            ProfileRoutingStore(path)
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert path.exists()
+    assert not list(tmp_path.glob("*.corrupt-*"))
+
+
+def test_uncreatable_database_path_is_unavailable_and_preserved(tmp_path):
+    parent_file = tmp_path / "not-a-directory"
+    parent_file.write_text("preserve me", encoding="utf-8")
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        ProfileRoutingStore(parent_file / "profile-routing.db")
+
+    assert parent_file.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_malformed_binding_row_is_wrapped_as_store_unavailability(
+    tmp_path, monkeypatch
+):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+
+    class MalformedRow(dict):
+        pass
+
+    row = MalformedRow(
+        scope_kind="not-a-scope",
+        platform="telegram",
+        account_id="telegram:primary",
+        chat_id="chat-1",
+        thread_id="",
+        profile_name="coder",
+        created_by_user_id="user-1",
+        created_at=1.0,
+        updated_at=1.0,
+        expires_at=None,
+        version=1,
+    )
+    monkeypatch.setattr(store, "_select_binding", lambda *_args: row)
+
+    with pytest.raises(ProfileRoutingStoreUnavailable):
+        store.get_binding(_scope(), ScopeKind.CHAT)
 
 
 @pytest.mark.requires_wal

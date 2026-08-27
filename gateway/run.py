@@ -2200,6 +2200,33 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
+class ProfileRuntimeUnavailable(RuntimeError):
+    """A named profile cannot safely provide its isolated runtime home."""
+
+    def __init__(self, profile_name: str, profile_home: "Path") -> None:
+        self.profile_name = profile_name
+        self.profile_home = Path(profile_home)
+        super().__init__(f"profile {profile_name!r} runtime home is unavailable")
+
+    @property
+    def user_message(self) -> str:
+        return (
+            f"Profile '{self.profile_name}' is unavailable. "
+            "The turn was stopped without falling back to another profile."
+        )
+
+
+def _require_accessible_profile_home(profile_name: str, profile_home: "Path") -> None:
+    """Fail closed when a named profile home disappeared or became unreadable."""
+    home = Path(profile_home)
+    try:
+        accessible = home.is_dir() and os.access(home, os.R_OK | os.X_OK)
+    except OSError:
+        accessible = False
+    if not accessible:
+        raise ProfileRuntimeUnavailable(profile_name, home)
+
+
 def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
     """Return the authoritative profile set for one multiplex gateway config."""
     from hermes_cli.profiles import profiles_to_serve
@@ -2213,7 +2240,11 @@ def _multiplex_profile_homes(config: object) -> list[tuple[str, "Path"]]:
 
 
 @_contextmanager
-def _profile_runtime_scope(profile_home: "Path"):
+def _profile_runtime_scope(
+    profile_home: "Path",
+    *,
+    required_profile_name: Optional[str] = None,
+):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
     Combines the two seams the multiplexer needs:
@@ -2238,6 +2269,9 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_secret_scope,
     )
     from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+    if required_profile_name and required_profile_name != "default":
+        _require_accessible_profile_home(required_profile_name, Path(profile_home))
 
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
@@ -6980,15 +7014,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
         self._profile_switching_service = None
-        if getattr(self.config.profile_switching, "enabled", False):
-            from gateway.profile_switching.service import ProfileSwitchingService
-
-            self._profile_switching_service = (
-                ProfileSwitchingService.from_gateway_config(
-                    self.config,
-                    db_path=get_hermes_home() / "state" / "profile-routing.db",
-                )
-            )
+        switching_enabled = (
+            getattr(self.config.profile_switching, "enabled", False) is True
+        )
+        self._profile_switching_degraded_service = None
+        self._profile_switching_init_lock = None
+        self._profile_switching_retry_after = 0.0
+        self._profile_switching_health = {
+            "status": "pending" if switching_enabled else "disabled",
+            "reason": None,
+            "attempts": 0,
+            "quarantined": (),
+        }
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -7971,14 +8008,195 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform = getattr(getattr(source, "platform", None), "value", "unknown")
         return f"{platform}:primary"
 
+    async def _ensure_profile_switching_service(self):
+        """Lazily initialize routing SQLite off-loop, with safe degradation."""
+        enabled = (
+            getattr(
+                getattr(getattr(self, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
+        if not enabled:
+            health = getattr(self, "_profile_switching_health", None)
+            if isinstance(health, dict):
+                health.update(status="disabled", reason=None)
+            return None
+
+        service = getattr(self, "_profile_switching_service", None)
+        if service is not None:
+            return service
+
+        loop = asyncio.get_running_loop()
+        degraded = getattr(self, "_profile_switching_degraded_service", None)
+        if loop.time() < float(getattr(self, "_profile_switching_retry_after", 0.0)):
+            return degraded
+
+        lock = getattr(self, "_profile_switching_init_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._profile_switching_init_lock = lock
+
+        async with lock:
+            service = getattr(self, "_profile_switching_service", None)
+            if service is not None:
+                return service
+            degraded = getattr(self, "_profile_switching_degraded_service", None)
+            if loop.time() < float(
+                getattr(self, "_profile_switching_retry_after", 0.0)
+            ):
+                return degraded
+
+            from gateway.profile_switching.service import ProfileSwitchingService
+            from gateway.profile_switching.store import (
+                ProfileRoutingStoreUnavailable,
+            )
+
+            health = getattr(self, "_profile_switching_health", None)
+            if not isinstance(health, dict):
+                health = {
+                    "status": "pending",
+                    "reason": None,
+                    "attempts": 0,
+                    "quarantined": (),
+                }
+                self._profile_switching_health = health
+            health["attempts"] = int(health.get("attempts", 0)) + 1
+            try:
+                service = await asyncio.to_thread(
+                    ProfileSwitchingService.from_gateway_config,
+                    self.config,
+                    db_path=get_hermes_home() / "state" / "profile-routing.db",
+                )
+            except Exception as exc:
+                reason = (
+                    "store_unavailable"
+                    if isinstance(exc, ProfileRoutingStoreUnavailable)
+                    else "initialization_failed"
+                )
+                logger.error(
+                    "Dynamic profile routing entered degraded mode (%s); "
+                    "database candidates will be skipped",
+                    reason,
+                    exc_info=True,
+                )
+                try:
+                    degraded = await asyncio.to_thread(
+                        ProfileSwitchingService.degraded_from_gateway_config,
+                        self.config,
+                    )
+                except Exception:
+                    logger.error(
+                        "Could not build degraded profile policy; routing will "
+                        "fall back to the default profile",
+                        exc_info=True,
+                    )
+                    degraded = None
+                self._profile_switching_degraded_service = degraded
+                self._profile_switching_retry_after = loop.time() + 5.0
+                health.update(status="degraded", reason=reason, quarantined=())
+                return degraded
+
+            self._profile_switching_service = service
+            self._profile_switching_degraded_service = None
+            self._profile_switching_retry_after = 0.0
+            quarantined = tuple(
+                str(path)
+                for path in getattr(
+                    getattr(service, "_store", None), "quarantined_paths", ()
+                )
+            )
+            health.update(
+                status="ready",
+                reason=("corrupt_store_quarantined" if quarantined else None),
+                quarantined=quarantined,
+            )
+            return service
+
+    def _runtime_scope_for_source(self, source: SessionSource):
+        """Return a profile scope with feature-on named-home revalidation."""
+        profile_home = self._resolve_profile_home_for_source(source)
+        switching_enabled = (
+            getattr(
+                getattr(getattr(self, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
+        required_profile = None
+        if switching_enabled:
+            candidate = getattr(source, "profile", None)
+            if isinstance(candidate, str) and candidate.strip():
+                required_profile = candidate.strip()
+        return _profile_runtime_scope(
+            profile_home,
+            required_profile_name=required_profile,
+        )
+
+    def _primary_transport_allows_dynamic_routing(
+        self,
+        event: MessageEvent,
+    ) -> bool:
+        """Side-effect-free admission check for primary-account routing.
+
+        This intentionally does not replace the canonical authorization and
+        pairing flow in ``_handle_message``. It only decides whether an event
+        may inspect or mutate profile-routing state before adapter busy/session
+        keying. Rejected senders remain on the default runtime so the later
+        handler can apply normal ignore/pairing semantics without exposing a
+        non-default profile hook, binding, or busy namespace.
+        """
+        source = event.source
+        source._profile_transport_drop = False
+        if event.internal:
+            return True
+        if getattr(
+            source, "platform", None
+        ) == Platform.SLACK and _is_slack_ignored_channel(
+            getattr(self, "config", None),
+            getattr(source, "chat_id", None),
+        ):
+            source._profile_transport_drop = True
+            return False
+
+        # Static routing may already have stamped a runtime profile in
+        # BasePlatformAdapter.build_source(). Transport admission must still
+        # use the primary account's allowlist and pairing store, never the
+        # candidate runtime profile's authorization state.
+        original_profile = getattr(source, "profile", None)
+        source._authorization_profile_home = Path(get_hermes_home())
+        try:
+            source.profile = None
+            return bool(self._is_user_authorized_for_source(source))
+        except Exception:
+            logger.warning(
+                "Primary transport eligibility check failed; skipping dynamic "
+                "profile routing",
+                exc_info=True,
+            )
+            return False
+        finally:
+            source.profile = original_profile
+
     async def _resolve_dynamic_profile_for_event(
         self,
         event: MessageEvent,
     ) -> None:
         """Resolve an event's runtime profile once, before session keying."""
-        service = getattr(self, "_profile_switching_service", None)
         source = event.source
-        if service is None or getattr(source, "_dynamic_profile_resolved", False):
+        if getattr(source, "_dynamic_profile_resolved", False):
+            return
+        switching_enabled = (
+            getattr(
+                getattr(getattr(self, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
+        if not switching_enabled:
             return
         transport_owner = getattr(source, "transport_owner_profile", None)
         if (
@@ -8006,6 +8224,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source._dynamic_profile_resolved = True
             return
 
+        if not self._primary_transport_allows_dynamic_routing(event):
+            # The later canonical handler remains responsible for normal
+            # authorization/pairing. Finalize a safe default here so neither a
+            # pre-resolved static route nor a stale rejection marker can enter
+            # a named runtime before that handler runs.
+            source.profile = None
+            source.profile_route_rejected = False
+            source._dynamic_profile_resolution_source = "default"
+            source._dynamic_profile_resolved = True
+            return
+
         static_profile = getattr(source, "profile", None)
         if (
             not static_profile
@@ -8024,6 +8253,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # dynamic result (including default/None) as authoritative.
         source._dynamic_profile_resolved = True
 
+        service = await self._ensure_profile_switching_service()
+        if service is None:
+            source.profile = None
+            source.profile_route_rejected = False
+            source._dynamic_profile_resolution_source = "default"
+            return
+
         from gateway.profile_switching.models import ScopeKey
 
         scope = ScopeKey.from_source(
@@ -8039,6 +8275,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         source._dynamic_profile_resolution_source = resolution.source.value
         source.profile = resolution.profile_name
+        # A completed feature-on resolution (including its authoritative safe
+        # default) supersedes any stale fail-closed marker produced by the
+        # earlier static-route seam. Feature-off never reaches this path, so a
+        # genuinely invalid legacy static route remains rejected.
+        source.profile_route_rejected = False
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -12563,14 +12804,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         a second time.
         """
         window = _auto_continue_freshness_window()
+        provenance_enabled = (
+            getattr(
+                getattr(getattr(self, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
 
         def _resume_transport_platform(source: SessionSource) -> Optional[Platform]:
-            transport_platform = getattr(source, "transport_platform", None)
-            if transport_platform is not None:
-                try:
-                    return Platform(transport_platform)
-                except (TypeError, ValueError):
-                    pass
+            if provenance_enabled:
+                transport_platform = getattr(source, "transport_platform", None)
+                if transport_platform is not None:
+                    try:
+                        return Platform(transport_platform)
+                    except (TypeError, ValueError):
+                        pass
             return getattr(source, "platform", None)
 
         try:
@@ -16314,7 +16564,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event.source.profile = profile_name
             except Exception:
                 pass
-            if getattr(self, "_profile_switching_service", None) is None:
+            switching_enabled = (
+                getattr(
+                    getattr(getattr(self, "config", None), "profile_switching", None),
+                    "enabled",
+                    False,
+                )
+                is True
+            )
+            if not switching_enabled:
                 if profile_home is not None:
                     with _profile_runtime_scope(profile_home):
                         return await self._handle_message(event)
@@ -16330,10 +16588,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Secondary credentials and runtime state remain in the same
                 # owner profile; shared primary bindings never enter this path.
                 source._authorization_profile_home = profile_home
-            if profile_home is not None:
-                with _profile_runtime_scope(profile_home):
+            try:
+                if profile_home is None:
+                    raise ProfileRuntimeUnavailable(
+                        profile_name,
+                        Path(get_hermes_home()),
+                    )
+                with self._runtime_scope_for_source(source):
                     return await self._handle_message(event)
-            return await self._handle_message(event)
+            except ProfileRuntimeUnavailable as exc:
+                logger.warning("Rejecting named profile turn: %s", exc)
+                return exc.user_message
 
         return _handler
 
@@ -16343,7 +16608,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _handler(event, _session_key):
             try:
                 if getattr(event, "source", None) is not None:
-                    if getattr(self, "_profile_switching_service", None) is not None:
+                    if (
+                        getattr(
+                            getattr(self.config, "profile_switching", None),
+                            "enabled",
+                            False,
+                        )
+                        is True
+                    ):
                         event.source.profile = profile_name
                         event.source.transport_owner_profile = profile_name
                         event.source.transport_platform = (
@@ -16400,14 +16672,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # routing for the same source.
                     source.profile_route_rejected = True
 
-            await self._resolve_dynamic_profile_for_event(event)
-            profile_home = (
-                self._resolve_profile_home_for_source(source)
-                if getattr(source, "profile", None)
-                else default_home
-            )
-            with _profile_runtime_scope(profile_home):
-                return await self._handle_message(event)
+            try:
+                await self._resolve_dynamic_profile_for_event(event)
+                if getattr(source, "profile", None):
+                    scope = self._runtime_scope_for_source(source)
+                else:
+                    scope = _profile_runtime_scope(default_home)
+                with scope:
+                    return await self._handle_message(event)
+            except ProfileRuntimeUnavailable as exc:
+                logger.warning("Rejecting named profile turn: %s", exc)
+                return exc.user_message
 
         return _handler
 
@@ -16441,7 +16716,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_home = None
 
         async def _handler(event, source):
-            if getattr(self, "_profile_switching_service", None) is not None:
+            if (
+                getattr(
+                    getattr(self.config, "profile_switching", None),
+                    "enabled",
+                    False,
+                )
+                is True
+            ):
                 source.profile = profile_name
                 source.transport_owner_profile = profile_name
                 source.transport_platform = (
@@ -16462,8 +16744,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _handler(event, source):
             source._authorization_profile_home = default_home
-            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return await self._handle_gateway_platform_event(event, source)
+            try:
+                with self._runtime_scope_for_source(source):
+                    return await self._handle_gateway_platform_event(event, source)
+            except ProfileRuntimeUnavailable:
+                logger.warning(
+                    "Skipping platform event for unavailable named profile",
+                    exc_info=True,
+                )
+                return None
 
         return _handler
 
@@ -19307,7 +19596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> Optional[str]:
         """Run inbound preprocessing under the routed profile when multiplexed."""
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+            with self._runtime_scope_for_source(source):
                 return await self._prepare_inbound_message_text(
                     event=event,
                     source=source,
@@ -21794,7 +22083,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         thread.
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+            with self._runtime_scope_for_source(source):
                 return self._format_session_info()
         return self._format_session_info()
 
@@ -23248,14 +23537,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id,
+                media_urls,
+                media_types,
             )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
-            )
+        try:
+            with self._runtime_scope_for_source(source):
+                return await self._run_background_task_inner(
+                    prompt,
+                    source,
+                    task_id,
+                    event_message_id,
+                    media_urls,
+                    media_types,
+                )
+        except ProfileRuntimeUnavailable as exc:
+            logger.warning("Rejecting named profile background task: %s", exc)
+            return exc.user_message
 
     def _resolve_enabled_toolsets_for_source(
         self,
@@ -28780,28 +29082,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
+                message,
+                context_prompt,
+                history,
+                source,
+                session_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+                moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
 
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                message_type=message_type,
-            )
+        try:
+            with self._runtime_scope_for_source(source):
+                return await self._run_agent_inner(
+                    message,
+                    context_prompt,
+                    history,
+                    source,
+                    session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth,
+                    event_message_id=event_message_id,
+                    channel_prompt=channel_prompt,
+                    moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    message_type=message_type,
+                )
+        except ProfileRuntimeUnavailable as exc:
+            logger.warning("Rejecting named profile agent turn: %s", exc)
+            return {
+                "final_response": exc.user_message,
+                "error": "profile_runtime_unavailable",
+            }
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -28829,6 +29151,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not routes:
             return None
         from gateway.profile_routing import ProfileRouteRejected, match_profile_route
+
         try:
             matched = match_profile_route(
                 routes,
@@ -28841,7 +29164,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.warning(
                 "Profile route matching failed for %s/%s, falling back to default",
-                source.platform, source.chat_id, exc_info=True,
+                source.platform,
+                source.chat_id,
+                exc_info=True,
             )
             return None
         if matched:
@@ -28865,8 +29190,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return matched.profile
         logger.debug(
             "No profile route matched: platform=%s chat_id=%s thread_id=%s parent_chat_id=%s",
-            source.platform.value, source.chat_id,
-            getattr(source, "thread_id", None), getattr(source, "parent_chat_id", None),
+            source.platform.value,
+            source.chat_id,
+            getattr(source, "thread_id", None),
+            getattr(source, "parent_chat_id", None),
         )
         return None
 
@@ -28887,7 +29214,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
-        
+
+        strict_named_profile = (
+            getattr(
+                getattr(getattr(self, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
+
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
         try:
@@ -28900,10 +29236,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     explicit_profile = name  # Routing explicitly set this profile
             if not name:
                 name = get_active_profile_name() or "default"
-            
+
             profile_dir = get_profile_dir(name)
-            # Warn if an explicit profile doesn't exist on disk
+            # A feature-enabled named runtime is a security boundary. Re-check
+            # both the currently served set and filesystem accessibility on
+            # every entry; never reinterpret a stale named route as default.
+            if strict_named_profile and explicit_profile and name != "default":
+                try:
+                    served_homes = dict(_multiplex_profile_homes(self.config))
+                except Exception as exc:
+                    raise ProfileRuntimeUnavailable(name, profile_dir) from exc
+                if name not in served_homes:
+                    raise ProfileRuntimeUnavailable(name, profile_dir)
+                _require_accessible_profile_home(name, profile_dir)
+
+            # Preserve legacy feature-off fallback only. Dynamic profile
+            # switching must never borrow the process/default home for a stale
+            # named session.
             if explicit_profile and not profile_exists(name):
+                if strict_named_profile and name != "default":
+                    raise ProfileRuntimeUnavailable(name, profile_dir)
                 logger.warning(
                     "Profile %r does not exist for source %s/%s (guild_id=%s), "
                     "falling back to global HERMES_HOME",
@@ -28914,9 +29266,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return get_hermes_home()
             return profile_dir
+        except ProfileRuntimeUnavailable:
+            raise
         except ProfileRouteRejected:
             raise
         except Exception:
+            if strict_named_profile and explicit_profile not in (None, "default"):
+                try:
+                    failed_home = get_profile_dir(explicit_profile)
+                except Exception:
+                    failed_home = Path(get_hermes_home())
+                raise ProfileRuntimeUnavailable(
+                    explicit_profile,
+                    failed_home,
+                )
             # Catch normalization errors, path errors, etc.
             logger.warning(
                 "Failed to resolve profile directory for source %s/%s (guild_id=%s), "

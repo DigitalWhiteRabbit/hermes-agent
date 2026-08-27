@@ -234,6 +234,12 @@ profiles are the only profiles served by this gateway configuration. The
 unserved here: sensitive profiles must use separate bot tokens and separate
 gateways, not this shared primary account.
 
+When dynamic routing is enabled, Milestone 1 rejects those three sensitive
+names if they appear in the served allowlist, visible profiles, or switch
+rules. It also rejects `require_confirmation: true`: confirmation UI is not
+available until a later milestone, so configuration cannot imply a safety
+check that is not enforced.
+
 Dynamic bindings belong to the primary account namespace
 `<platform>:primary` (for example, `telegram:primary`). A bot owned by a
 secondary profile is a distinct transport account and skips the shared dynamic
@@ -255,8 +261,18 @@ that durable transport provenance separately as `transport_owner_profile` and
 When this feature is enabled, the default/primary gateway creates the SQLite
 database at `$HERMES_HOME/state/profile-routing.db` (normally
 `~/.hermes/state/profile-routing.db`). The database stores routing scope IDs,
-profile names, session IDs, policy outcomes, timestamps, and hashed picker
-nonces. It never stores message text, bot tokens, API keys, or other secrets.
+profile names, session IDs, policy outcomes, and timestamps. Its schema
+reserves a picker-nonce table for Milestone 2, but Milestone 1 does not issue or
+store picker nonce rows. It never stores message text, bot tokens, API keys, or
+other secrets.
+
+The database is initialized off the gateway event loop on first use. If it is
+locked or cannot be created, routing enters a diagnostic degraded state:
+database-backed candidates are skipped, while static and default candidates
+still pass through the fail-closed policy. A corrupt database (and any WAL/SHM
+sidecars) is renamed with a UTC `.corrupt-...` suffix before Hermes creates a
+fresh database; it is never silently deleted. Check gateway logs and preserve
+the quarantined files for recovery or diagnosis.
 
 Milestone 1 does not create a separate automatic backup for this database.
 Include it in the normal backup of the default profile. For a consistent manual
@@ -271,7 +287,9 @@ an operator-managed retention process if audit-volume limits are required.
 
 Setting `gateway.profile_switching.enabled: false` (the default) leaves the
 existing static routes unchanged, does not initialize the switching service,
-and does not create `state/profile-routing.db`.
+does not create `state/profile-routing.db`, omits the switching block from
+serialized gateway config, and retains the legacy feature-off session wire
+shape without dynamic transport-provenance fields.
 
 :::note Inside the official Docker image
 Per-profile gateways are supervised by [s6-overlay](https://github.com/just-containers/s6-overlay) (PID 1 in the container), so `hermes profile create <name>` automatically registers an s6 service slot at `/run/service/gateway-<name>/`. `hermes -p <name> gateway start/stop/restart` dispatches to `s6-svc` instead of spawning a bare process — crashes are auto-restarted and `docker restart` preserves the previously-running set of gateways. See [Per-profile gateway supervision](/user-guide/docker#per-profile-gateway-supervision) for details.

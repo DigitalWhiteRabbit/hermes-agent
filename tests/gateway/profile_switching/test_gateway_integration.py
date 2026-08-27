@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import shutil
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +20,7 @@ from gateway.config import (
 )
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 from gateway.profile_routing import ProfileRoute
-from gateway.profile_switching.models import ScopeKey, ScopeKind
+from gateway.profile_switching.models import ReasonCode, ScopeKey, ScopeKind
 from gateway.profile_switching.policy import ProfilePolicy
 from gateway.profile_switching.service import ProfileSwitchingService
 from gateway.profile_switching.store import (
@@ -92,6 +96,7 @@ def _runner_with_store(tmp_path) -> tuple[GatewayRunner, ProfileRoutingStore]:
     runner._profile_switching_service = ProfileSwitchingService(store, policy)
     runner.adapters = {}
     runner._profile_adapters = {}
+    runner._is_user_authorized_for_source = lambda _source: True
     return runner, store
 
 
@@ -160,21 +165,197 @@ def _set_binding(
     )
 
 
-def test_enabled_runner_initializes_real_service_and_default_policy():
+@pytest.mark.asyncio
+async def test_enabled_runner_lazily_initializes_real_service_and_default_policy():
     homes = _create_profile_homes()
     config = _gateway_config()
+    path = homes["default"] / "state" / "profile-routing.db"
 
     runner = GatewayRunner(config)
 
-    assert runner._profile_switching_service is not None
-    assert (homes["default"] / "state" / "profile-routing.db").exists()
-    resolution = runner._profile_switching_service.resolve(
+    assert runner._profile_switching_service is None
+    assert not path.exists()
+    service = await runner._ensure_profile_switching_service()
+    assert service is runner._profile_switching_service
+    assert path.exists()
+    assert runner._profile_switching_health["status"] == "ready"
+    resolution = service.resolve(
         scope=ScopeKey("telegram", "telegram:primary", "chat-1", None),
         actor_user_id="user-1",
         consume_once=True,
         static_profile="default",
     )
     assert resolution.profile_name == "default"
+
+
+@pytest.mark.asyncio
+async def test_feature_off_constructor_and_first_use_do_no_routing_db_work(
+    monkeypatch,
+):
+    homes = _create_profile_homes()
+    path = homes["default"] / "state" / "profile-routing.db"
+    from gateway.profile_switching.service import ProfileSwitchingService
+
+    invoked = False
+
+    def forbidden(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("feature-off must not initialize routing SQLite")
+
+    monkeypatch.setattr(ProfileSwitchingService, "from_gateway_config", forbidden)
+    runner = GatewayRunner(_gateway_config(enabled=False))
+
+    assert await runner._ensure_profile_switching_service() is None
+    assert invoked is False
+    assert not path.exists()
+    assert runner._profile_switching_health["status"] == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_lazy_routing_store_initialization_never_blocks_event_loop(
+    monkeypatch,
+):
+    _create_profile_homes()
+    from gateway.profile_switching.service import ProfileSwitchingService
+
+    started = threading.Event()
+    release = threading.Event()
+    fake_service = object()
+
+    def blocking_init(*_args, **_kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return fake_service
+
+    monkeypatch.setattr(ProfileSwitchingService, "from_gateway_config", blocking_init)
+    runner = GatewayRunner(_gateway_config())
+    task = asyncio.create_task(runner._ensure_profile_switching_service())
+    assert await asyncio.to_thread(started.wait, 1)
+
+    loop_progressed = False
+
+    async def tick():
+        nonlocal loop_progressed
+        await asyncio.sleep(0)
+        loop_progressed = True
+
+    await tick()
+    assert loop_progressed is True
+    release.set()
+    assert await task is fake_service
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["database is locked", "permission denied"])
+async def test_failed_lazy_initialization_enters_diagnostic_degraded_state(
+    monkeypatch, failure
+):
+    _create_profile_homes()
+    from gateway.profile_switching.service import ProfileSwitchingService
+
+    def fail(*_args, **_kwargs):
+        raise ProfileRoutingStoreUnavailable(failure)
+
+    monkeypatch.setattr(ProfileSwitchingService, "from_gateway_config", fail)
+    runner = GatewayRunner(_gateway_config())
+    runner._is_user_authorized_for_source = lambda _source: True
+    service = await runner._ensure_profile_switching_service()
+
+    assert service is not None
+    assert runner._profile_switching_service is None
+    assert runner._profile_switching_health["status"] == "degraded"
+    assert runner._profile_switching_health["reason"] == "store_unavailable"
+
+    event = _event(runner)
+    event.source.profile = "default"
+    decision = service._policy.evaluate("default", _scope(event), "user-1")
+    assert decision.allowed, decision
+    await runner._resolve_dynamic_profile_for_event(event)
+    assert event.source.profile == "default"
+    assert event.source._dynamic_profile_resolution_source == "static"
+    assert service.resolution_metrics[ReasonCode.DB_UNAVAILABLE.value] == 1
+
+
+@pytest.mark.asyncio
+async def test_degraded_lazy_initialization_recovers_on_a_later_turn(monkeypatch):
+    _create_profile_homes()
+    from gateway.profile_switching.service import ProfileSwitchingService
+
+    real_factory = ProfileSwitchingService.from_gateway_config
+    attempts = 0
+
+    def flaky(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ProfileRoutingStoreUnavailable("database is locked")
+        return real_factory(*args, **kwargs)
+
+    monkeypatch.setattr(ProfileSwitchingService, "from_gateway_config", flaky)
+    runner = GatewayRunner(_gateway_config())
+    degraded = await runner._ensure_profile_switching_service()
+    assert degraded is not None
+    runner._profile_switching_retry_after = 0.0
+
+    recovered = await runner._ensure_profile_switching_service()
+
+    assert recovered is runner._profile_switching_service
+    assert attempts == 2
+    assert runner._profile_switching_health["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_failed_degraded_policy_build_respects_initialization_retry_cooldown(
+    monkeypatch,
+):
+    _create_profile_homes()
+    from gateway.profile_switching.service import ProfileSwitchingService
+
+    attempts = 0
+    degraded_attempts = 0
+
+    def fail_store(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise ProfileRoutingStoreUnavailable("database is locked")
+
+    def fail_policy(*_args, **_kwargs):
+        nonlocal degraded_attempts
+        degraded_attempts += 1
+        raise RuntimeError("profile policy unavailable")
+
+    monkeypatch.setattr(ProfileSwitchingService, "from_gateway_config", fail_store)
+    monkeypatch.setattr(
+        ProfileSwitchingService,
+        "degraded_from_gateway_config",
+        fail_policy,
+    )
+    runner = GatewayRunner(_gateway_config())
+
+    assert await runner._ensure_profile_switching_service() is None
+    assert await runner._ensure_profile_switching_service() is None
+    assert attempts == 1
+    assert degraded_attempts == 1
+    assert runner._profile_switching_health["status"] == "degraded"
+
+
+@pytest.mark.asyncio
+async def test_lazy_initialization_reports_recoverable_corruption_quarantine():
+    homes = _create_profile_homes()
+    path = homes["default"] / "state" / "profile-routing.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"corrupt routing state")
+    runner = GatewayRunner(_gateway_config())
+
+    service = await runner._ensure_profile_switching_service()
+
+    assert service is runner._profile_switching_service
+    assert runner._profile_switching_health["status"] == "ready"
+    assert runner._profile_switching_health["reason"] == "corrupt_store_quarantined"
+    quarantined = runner._profile_switching_health["quarantined"]
+    assert len(quarantined) == 1
+    assert Path(quarantined[0]).read_bytes() == b"corrupt routing state"
 
 
 @pytest.mark.asyncio
@@ -264,6 +445,131 @@ async def test_primary_adapter_resolves_before_busy_session_key(tmp_path):
     await adapter.handle_message(event)
 
     assert captured_keys == ["agent:research:telegram:dm:chat-1"]
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_primary_input_cannot_claim_or_enter_routed_busy_state(
+    tmp_path,
+):
+    runner, store = _runner_with_store(tmp_path)
+    homes = _create_profile_homes()
+    event = _event(runner)
+    event.source.profile_route_rejected = True
+    store.set_once(
+        _scope(event),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    runner._is_user_authorized_for_source = lambda _source: False
+    adapter = _StubAdapter(
+        PlatformConfig(enabled=True),
+        Platform.TELEGRAM,
+    )
+    adapter.gateway_runner = runner
+    handler = runner._make_default_profile_message_handler()
+    adapter.set_message_handler(handler)
+    captured_keys: list[str] = []
+    adapter._start_session_processing = lambda _event, session_key: (
+        captured_keys.append(session_key)
+    )
+    captured_runtime: list[tuple[Path, str | None]] = []
+
+    async def capture(rejected_event: MessageEvent):
+        captured_runtime.append((get_hermes_home(), rejected_event.source.profile))
+
+    runner._handle_message = capture
+
+    await adapter.handle_message(event)
+    await handler(event)
+
+    assert captured_keys == ["agent:main:telegram:dm:chat-1"]
+    assert captured_runtime == [(homes["default"], None)]
+    assert event.source.profile_route_rejected is False
+    assert store.claim_once(_scope(event)).profile_name == "research"
+
+
+@pytest.mark.asyncio
+async def test_pairing_relevant_input_runs_canonical_pairing_only_in_default_scope(
+    tmp_path, monkeypatch
+):
+    runner, store = _runner_with_store(tmp_path)
+    homes = _create_profile_homes()
+    event = _event(runner)
+    store.set_once(
+        _scope(event),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    runner._is_user_authorized_for_source = lambda _source: False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    hook_homes: list[Path] = []
+
+    import hermes_cli.lifecycle as lifecycle
+
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda *_args, **_kwargs: hook_homes.append(get_hermes_home()) or [],
+    )
+
+    pairing_store = SimpleNamespace(
+        profile="default",
+        _is_rate_limited=lambda *_args: False,
+        generate_code=lambda *_args: "PAIR-CODE",
+    )
+    runner._pairing_store_for = lambda _source: pairing_store
+    runner._get_unauthorized_dm_behavior = lambda *_args, **_kwargs: "pair"
+    send = AsyncMock()
+    runner._adapter_for_source = lambda _source: SimpleNamespace(send=send)
+
+    result = await runner._make_default_profile_message_handler()(event)
+
+    assert result is None
+    assert event.source.profile is None
+    assert hook_homes == [homes["default"]]
+    send.assert_awaited_once()
+    assert "PAIR-CODE" in send.await_args.args[1]
+    assert store.claim_once(_scope(event)).profile_name == "research"
+
+
+@pytest.mark.asyncio
+async def test_ignored_slack_input_is_dropped_before_claim_or_busy_state(tmp_path):
+    runner, store = _runner_with_store(tmp_path)
+    runner.config.platforms[Platform.SLACK] = PlatformConfig(
+        enabled=True,
+        extra={"ignored_channels": ["C-ignored"]},
+    )
+    adapter = _StubAdapter(
+        runner.config.platforms[Platform.SLACK],
+        Platform.SLACK,
+    )
+    adapter.gateway_runner = runner
+    event = MessageEvent(
+        text="hello",
+        source=adapter.build_source(
+            chat_id="C-ignored",
+            chat_type="channel",
+            user_id="user-1",
+        ),
+    )
+    scope = ScopeKey.from_source(event.source, account_id="slack:primary")
+    store.set_once(
+        scope,
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    handler = AsyncMock()
+    adapter.set_message_handler(handler)
+    captured_keys: list[str] = []
+    adapter._start_session_processing = lambda _event, session_key: (
+        captured_keys.append(session_key)
+    )
+
+    await adapter.handle_message(event)
+
+    assert captured_keys == []
+    handler.assert_not_awaited()
+    assert store.claim_once(scope).profile_name == "research"
 
 
 @pytest.mark.asyncio
@@ -362,6 +668,7 @@ async def test_primary_topic_recovery_preserves_live_transport_owner(tmp_path):
 async def test_disabled_switching_preserves_secondary_runtime_scope(tmp_path):
     runner, _store = _runner_with_store(tmp_path)
     homes = _create_profile_homes()
+    runner.config = _gateway_config(enabled=False)
     runner._profile_switching_service = None
     event = _event(runner)
     captured: dict[str, object] = {}
@@ -375,6 +682,8 @@ async def test_disabled_switching_preserves_secondary_runtime_scope(tmp_path):
 
     assert captured["runtime_home"] == homes["origin"]
     assert event.source.profile == "static"
+    assert event.source.transport_owner_profile is None
+    assert event.source.transport_platform is None
 
 
 @pytest.mark.asyncio
@@ -390,6 +699,113 @@ async def test_dynamic_resolution_keeps_authorization_home_on_primary_profile(
 
     assert captured["runtime_home"] == homes["coder"]
     assert captured["authorization_home"] == homes["default"]
+
+
+def test_service_revalidates_deleted_profile_after_startup(tmp_path):
+    homes = _create_profile_homes()
+    config = _gateway_config()
+    service = ProfileSwitchingService.from_gateway_config(
+        config,
+        db_path=tmp_path / "profile-routing.db",
+    )
+    scope = ScopeKey("telegram", "telegram:primary", "chat-2", None)
+    service._store.set_binding(
+        scope,
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    shutil.rmtree(homes["coder"])
+
+    resolution = service.resolve(
+        scope=scope,
+        actor_user_id="user-1",
+        consume_once=True,
+        static_profile=None,
+    )
+
+    assert resolution.profile_name is None
+    assert resolution.source.value == "default"
+
+
+def test_service_revalidates_unreadable_profile_after_startup(tmp_path):
+    homes = _create_profile_homes()
+    config = _gateway_config()
+    service = ProfileSwitchingService.from_gateway_config(
+        config,
+        db_path=tmp_path / "profile-routing.db",
+    )
+    scope = ScopeKey("telegram", "telegram:primary", "chat-2", None)
+    service._store.set_binding(
+        scope,
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    homes["coder"].chmod(0)
+    try:
+        assert not os.access(homes["coder"], os.R_OK | os.X_OK)
+        resolution = service.resolve(
+            scope=scope,
+            actor_user_id="user-1",
+            consume_once=True,
+            static_profile=None,
+        )
+    finally:
+        homes["coder"].chmod(0o700)
+
+    assert resolution.profile_name is None
+    assert resolution.source.value == "default"
+
+
+@pytest.mark.asyncio
+async def test_deleted_profile_between_resolution_and_runtime_fails_the_turn(
+    tmp_path,
+):
+    runner, store = _runner_with_store(tmp_path)
+    homes = _create_profile_homes()
+    event = _event(runner)
+    _set_binding(store, _scope(event), ScopeKind.CHAT, "coder")
+    resolve = runner._resolve_dynamic_profile_for_event
+
+    async def resolve_then_delete(resolved_event: MessageEvent):
+        await resolve(resolved_event)
+        shutil.rmtree(homes["coder"], ignore_errors=True)
+
+    runner._resolve_dynamic_profile_for_event = resolve_then_delete
+    runner._handle_message = AsyncMock()
+
+    result = await runner._make_default_profile_message_handler()(event)
+
+    assert "coder" in result
+    assert "unavailable" in result.lower()
+    runner._handle_message.assert_not_awaited()
+    assert get_hermes_home() == homes["default"]
+
+
+@pytest.mark.asyncio
+async def test_profile_home_toctou_at_scope_entry_never_enters_default_runtime(
+    tmp_path,
+):
+    runner, _store = _runner_with_store(tmp_path)
+    homes = _create_profile_homes()
+    event = _event(runner)
+    event.source.profile = "coder"
+    event.source._dynamic_profile_resolved = True
+    runner._handle_message = AsyncMock()
+
+    def resolve_then_delete(_source: SessionSource) -> Path:
+        shutil.rmtree(homes["coder"], ignore_errors=True)
+        return homes["coder"]
+
+    runner._resolve_profile_home_for_source = resolve_then_delete
+
+    result = await runner._make_default_profile_message_handler()(event)
+
+    assert "coder" in result
+    assert "unavailable" in result.lower()
+    runner._handle_message.assert_not_awaited()
+    assert get_hermes_home() == homes["default"]
 
 
 @pytest.mark.asyncio
@@ -425,11 +841,33 @@ async def test_direct_handle_message_uses_dynamic_resolution_fallback(tmp_path):
         profile_name="research",
         created_by_user_id="user-1",
     )
+    queued: list[MessageEvent] = []
+    runner._startup_restore_in_progress = True
+    runner._queue_startup_restore_event = queued.append
 
     result = await GatewayRunner._handle_message(runner, event)
 
     assert result is None
     assert event.source.profile == "research"
+    assert event.source.profile_route_rejected is False
+    assert queued == [event]
+
+
+@pytest.mark.asyncio
+async def test_feature_off_keeps_real_static_route_rejection(tmp_path):
+    runner, _store = _runner_with_store(tmp_path)
+    runner.config = _gateway_config(enabled=False)
+    runner._profile_switching_service = None
+    event = _event(runner)
+    event.source.profile = None
+    event.source.profile_route_rejected = True
+    queued: list[MessageEvent] = []
+    runner._startup_restore_in_progress = True
+    runner._queue_startup_restore_event = queued.append
+
+    assert await GatewayRunner._handle_message(runner, event) is None
+    assert event.source.profile_route_rejected is True
+    assert queued == []
 
 
 @pytest.mark.asyncio
@@ -608,10 +1046,14 @@ async def test_denied_static_is_not_reapplied_after_dynamic_resolution(
     assert captured["session_key"] == "agent:main:telegram:dm:chat-1"
 
     direct = _event(runner)
+    direct.source.profile_route_rejected = True
     runner._startup_restore_in_progress = True
-    runner._queue_startup_restore_event = lambda _event: None
+    queued: list[MessageEvent] = []
+    runner._queue_startup_restore_event = queued.append
     assert await GatewayRunner._handle_message(runner, direct) is None
     assert direct.source.profile is None
+    assert direct.source.profile_route_rejected is False
+    assert queued == [direct]
 
 
 def test_transport_account_identity_is_stable_across_runtime_profiles(tmp_path):

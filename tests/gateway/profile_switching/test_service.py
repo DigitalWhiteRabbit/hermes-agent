@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 
 import pytest
@@ -414,6 +415,31 @@ def test_each_mutation_appends_redacted_audit(tmp_path):
             active_turn=False,
             message_text="do not accept this",
         )
+
+
+def test_resolution_audit_is_bounded_and_redacts_identifiers(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "routing.db")
+    service = ProfileSwitchingService(
+        store,
+        _policy("static"),
+        resolution_audit_limit=2,
+    )
+    for profile in ("secret-one", "secret-two", "secret-three"):
+        service.resolve(
+            scope=_scope(),
+            actor_user_id="sensitive-user-id",
+            consume_once=False,
+            static_profile=profile,
+        )
+
+    audit = service.resolution_audit
+    rendered = json.dumps(audit)
+    assert len(audit) == 2
+    assert service.resolution_metrics[ReasonCode.PROFILE_UNKNOWN.value] == 3
+    assert "sensitive-user-id" not in rendered
+    assert "telegram:primary" not in rendered
+    assert "chat-1" not in rendered
+    assert "secret-" not in rendered
 
 
 def test_note_session_keeps_one_session_per_profile_and_scope(tmp_path):

@@ -32,7 +32,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, HomeChannel, Platform
+from gateway.config import (
+    GatewayConfig,
+    HomeChannel,
+    Platform,
+    ProfileSwitchingConfig,
+)
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
@@ -707,6 +712,7 @@ async def test_reconnect_reschedule_is_platform_scoped():
 @pytest.mark.asyncio
 async def test_dynamic_profile_auto_resume_uses_persisted_primary_owner():
     runner, primary = make_restart_runner()
+    runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
     secondary = object()
     runner._profile_adapters = {
         "coder": {Platform.TELEGRAM: secondary},
@@ -751,6 +757,7 @@ async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
     monkeypatch,
 ):
     runner, native = make_restart_runner()
+    runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
     _clear_names = (
         "DISCORD_ALLOWED_USERS",
         "GATEWAY_ALLOWED_USERS",
@@ -774,7 +781,10 @@ async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
     del runner._is_user_authorized
     persisted = SessionStore(
         sessions_dir=tmp_path,
-        config=GatewayConfig(multiplex_profiles=True),
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
     )
     persisted._db = None
     source = SessionSource(
@@ -794,7 +804,10 @@ async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
 
     restarted = SessionStore(
         sessions_dir=tmp_path,
-        config=GatewayConfig(multiplex_profiles=True),
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
     )
     restarted._db = None
     restarted._ensure_loaded()
@@ -822,6 +835,7 @@ async def test_relay_reconnect_retries_only_persisted_relay_transport_bucket(
     monkeypatch,
 ):
     runner, native = make_restart_runner()
+    runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
     for name in (
         "DISCORD_ALLOWED_USERS",
         "GATEWAY_ALLOWED_USERS",
@@ -836,7 +850,10 @@ async def test_relay_reconnect_retries_only_persisted_relay_transport_bucket(
 
     persisted = SessionStore(
         sessions_dir=tmp_path,
-        config=GatewayConfig(multiplex_profiles=True),
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
     )
     persisted._db = None
     relay_entry = persisted.get_or_create_session(
@@ -876,7 +893,10 @@ async def test_relay_reconnect_retries_only_persisted_relay_transport_bucket(
 
     restarted = SessionStore(
         sessions_dir=tmp_path,
-        config=GatewayConfig(multiplex_profiles=True),
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
     )
     restarted._db = None
     restarted._ensure_loaded()
@@ -963,6 +983,37 @@ def test_legacy_resume_source_without_transport_owner_keeps_profile_lookup():
     assert runner._adapter_for_source(source) is secondary
     assert runner._adapter_for_source(make_restart_source()) is primary
     assert source.transport_platform is None
+
+
+def test_feature_off_restart_omits_provenance_and_keeps_profile_adapter_fallback(
+    tmp_path,
+):
+    config = GatewayConfig(multiplex_profiles=True)
+    persisted = SessionStore(sessions_dir=tmp_path, config=config)
+    persisted._db = None
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="feature-off-chat",
+        chat_type="dm",
+        user_id="u1",
+        profile="coder",
+        transport_owner_profile="default",
+        transport_platform=Platform.RELAY,
+    )
+    entry = persisted.get_or_create_session(source)
+
+    restarted = SessionStore(sessions_dir=tmp_path, config=config)
+    restarted._db = None
+    restarted._ensure_loaded()
+    restored = restarted._entries[entry.session_key].origin
+    assert restored is not None
+    assert restored.transport_owner_profile is None
+    assert restored.transport_platform is None
+
+    runner, _primary = make_restart_runner()
+    secondary = object()
+    runner._profile_adapters = {"coder": {Platform.TELEGRAM: secondary}}
+    assert runner._adapter_for_source(restored) is secondary
 
 
 @pytest.mark.asyncio

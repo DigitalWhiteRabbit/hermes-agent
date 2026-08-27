@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from .models import (
     ProfileBinding,
     ProfileResolution,
@@ -30,10 +32,26 @@ class ProfileResolver:
         actor_user_id: str,
         consume_once: bool,
         static_profile: str | None,
+        on_diagnostic: Callable[[ResolutionSource | None, str | None, ReasonCode], None]
+        | None = None,
     ) -> ProfileResolution:
+        def emit(
+            source: ResolutionSource | None,
+            profile_name: str | None,
+            reason: ReasonCode,
+        ) -> None:
+            if on_diagnostic is None:
+                return
+            try:
+                on_diagnostic(source, profile_name, reason)
+            except Exception:
+                # Observability is never part of the authorization decision.
+                pass
+
         candidates: list[
             tuple[ResolutionSource, ProfileBinding | None, str | None]
         ] = []
+        db_unavailable = False
         try:
             if consume_once:
                 once = self._store.claim_once(scope)
@@ -57,6 +75,8 @@ class ProfileResolver:
             ])
         except ProfileRoutingStoreUnavailable:
             candidates = []
+            db_unavailable = True
+            emit(None, None, ReasonCode.DB_UNAVAILABLE)
 
         candidates.append((ResolutionSource.STATIC, None, static_profile))
         for source, binding, profile_name in candidates:
@@ -67,11 +87,12 @@ class ProfileResolver:
                 return ProfileResolution(
                     profile_name,
                     source,
-                    decision.reason,
+                    (ReasonCode.DB_UNAVAILABLE if db_unavailable else decision.reason),
                     binding,
                 )
+            emit(source, profile_name, decision.reason)
         return ProfileResolution(
             None,
             ResolutionSource.DEFAULT,
-            ReasonCode.NO_MATCH,
+            (ReasonCode.DB_UNAVAILABLE if db_unavailable else ReasonCode.NO_MATCH),
         )

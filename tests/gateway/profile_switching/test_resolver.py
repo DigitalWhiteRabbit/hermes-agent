@@ -213,6 +213,7 @@ def test_db_failure_falls_back_to_static_not_sensitive_candidate():
 
     assert resolution.profile_name == "static"
     assert resolution.source is ResolutionSource.STATIC
+    assert resolution.reason is ReasonCode.DB_UNAVAILABLE
 
 
 def test_db_failure_still_evaluates_static_fail_closed():
@@ -231,7 +232,48 @@ def test_db_failure_still_evaluates_static_fail_closed():
 
     assert resolution.profile_name is None
     assert resolution.source is ResolutionSource.DEFAULT
-    assert resolution.reason is ReasonCode.NO_MATCH
+    assert resolution.reason is ReasonCode.DB_UNAVAILABLE
+
+
+def test_resolution_diagnostics_cover_denied_and_database_fallback(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "routing.db")
+    store.set_once(_scope(), profile_name="revoked", created_by_user_id="user-1")
+    resolver = ProfileResolver(store, _policy("static"))
+    diagnostics = []
+
+    resolution = resolver.resolve(
+        _scope(),
+        actor_user_id="user-1",
+        consume_once=True,
+        static_profile="static",
+        on_diagnostic=lambda *values: diagnostics.append(values),
+    )
+
+    assert resolution.profile_name == "static"
+    assert diagnostics == [
+        (ResolutionSource.ONCE, "revoked", ReasonCode.PROFILE_UNKNOWN)
+    ]
+
+
+def test_resolution_diagnostic_failure_cannot_abort_safe_fallback():
+    class UnavailableStore:
+        def get_binding(self, scope, scope_kind):
+            raise ProfileRoutingStoreUnavailable("database unavailable")
+
+    resolver = ProfileResolver(UnavailableStore(), _policy("static"))
+
+    resolution = resolver.resolve(
+        _scope(),
+        actor_user_id="user-1",
+        consume_once=False,
+        static_profile="static",
+        on_diagnostic=lambda *_values: (_ for _ in ()).throw(
+            RuntimeError("audit failed")
+        ),
+    )
+
+    assert resolution.profile_name == "static"
+    assert resolution.reason is ReasonCode.DB_UNAVAILABLE
 
 
 def test_policy_errors_are_not_treated_as_database_fallback(tmp_path):

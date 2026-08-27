@@ -1,12 +1,18 @@
 """Tests for gateway session management."""
 import json
 import pytest
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from hermes_state import SessionDB
-from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
+from gateway.config import (
+    Platform,
+    HomeChannel,
+    GatewayConfig,
+    PlatformConfig,
+    ProfileSwitchingConfig,
+)
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
     SessionEntry,
@@ -82,12 +88,21 @@ class TestSessionSourceRoundtrip:
         assert legacy.transport_owner_profile is None
         assert legacy.transport_platform is None
 
+    def test_transport_provenance_fields_are_appended_for_positional_compatibility(
+        self,
+    ):
+        names = [item.name for item in fields(SessionSource)]
+
+        assert names[-2:] == ["transport_owner_profile", "transport_platform"]
+
 
 class TestSessionSourceDescription:
     def test_local_cli(self):
         source = SessionSource(
-            platform=Platform.LOCAL, chat_id="cli",
-            chat_name="CLI terminal", chat_type="dm",
+            platform=Platform.LOCAL,
+            chat_id="cli",
+            chat_name="CLI terminal",
+            chat_type="dm",
         )
         assert source.description == "CLI terminal"
 
@@ -1657,7 +1672,10 @@ class TestGatewayRoutingTable:
         restarted._db.close()
 
     def test_dynamic_transport_owner_survives_database_restart(self, tmp_path):
-        config = GatewayConfig(multiplex_profiles=True)
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
         store = SessionStore(sessions_dir=tmp_path, config=config)
         source = self._source()
         source.profile = "coder"
@@ -1682,7 +1700,10 @@ class TestGatewayRoutingTable:
     def test_dynamic_transport_provenance_survives_sessions_json_restart(
         self, tmp_path
     ):
-        config = GatewayConfig(multiplex_profiles=True)
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
         store = SessionStore(sessions_dir=tmp_path, config=config)
         store._db = None
         source = self._source()
@@ -1702,6 +1723,91 @@ class TestGatewayRoutingTable:
         assert restored.profile == "coder"
         assert restored.transport_owner_profile == "default"
         assert restored.transport_platform == Platform.RELAY
+
+    @pytest.mark.parametrize(
+        ("first_transport", "second_transport"),
+        [
+            (Platform.TELEGRAM, Platform.RELAY),
+            (Platform.RELAY, Platform.TELEGRAM),
+        ],
+    )
+    def test_reused_dynamic_session_refreshes_origin_in_database_and_json(
+        self, tmp_path, first_transport, second_transport
+    ):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        first = self._source()
+        first.profile = "coder"
+        first.transport_owner_profile = "default"
+        first.transport_platform = first_transport
+        original = store.get_or_create_session(first)
+
+        second = self._source()
+        second.profile = "coder"
+        second.transport_owner_profile = "default"
+        second.transport_platform = second_transport
+        reused = store.get_or_create_session(second)
+
+        assert reused.session_id == original.session_id
+        assert reused.origin is second
+        assert reused.origin.transport_platform == second_transport
+
+        sessions_json = json.loads((tmp_path / "sessions.json").read_text())
+        persisted_json = SessionEntry.from_dict(sessions_json[reused.session_key])
+        assert persisted_json.origin is not None
+        assert persisted_json.origin.transport_platform == second_transport
+
+        (tmp_path / "sessions.json").unlink()
+        store._db.close()
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        persisted_db = restarted._entries[reused.session_key]
+        assert persisted_db.session_id == original.session_id
+        assert persisted_db.origin is not None
+        assert persisted_db.origin.transport_platform == second_transport
+        restarted._db.close()
+
+    def test_legacy_dynamic_session_backfills_transport_provenance(self, tmp_path):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        legacy = self._source()
+        legacy.profile = "coder"
+        original = store.get_or_create_session(legacy)
+
+        incoming = self._source()
+        incoming.profile = "coder"
+        incoming.transport_owner_profile = "default"
+        incoming.transport_platform = Platform.RELAY
+        reused = store.get_or_create_session(incoming)
+
+        assert reused.session_id == original.session_id
+        assert reused.origin is incoming
+        assert reused.origin.transport_owner_profile == "default"
+        assert reused.origin.transport_platform == Platform.RELAY
+
+    def test_feature_off_does_not_persist_transport_provenance(self, tmp_path):
+        config = GatewayConfig(multiplex_profiles=True)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = self._source()
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+
+        entry = store.get_or_create_session(source)
+
+        assert entry.origin is not None
+        assert entry.origin.transport_owner_profile is None
+        assert entry.origin.transport_platform is None
+        persisted = json.loads((tmp_path / "sessions.json").read_text())
+        origin = persisted[entry.session_key]["origin"]
+        assert "transport_owner_profile" not in origin
+        assert "transport_platform" not in origin
 
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)

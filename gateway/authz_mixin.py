@@ -105,6 +105,17 @@ def _normalize_transport_platform(value: object) -> Optional[Platform]:
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
+    def _profile_switching_provenance_enabled(self) -> bool:
+        """Use durable transport provenance only for the opt-in feature."""
+        return (
+            getattr(
+                getattr(getattr(self, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
+
     def _authorization_adapter(
         self,
         platform: Optional[Platform],
@@ -162,26 +173,27 @@ class GatewayAuthorizationMixin:
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
-        transport_owner = getattr(source, "transport_owner_profile", None)
-        transport_platform = _normalize_transport_platform(
-            getattr(source, "transport_platform", None)
-        )
-        if transport_platform is not None:
-            owner_profile = (
-                transport_owner.strip()
-                if isinstance(transport_owner, str) and transport_owner.strip()
-                else None
+        if self._profile_switching_provenance_enabled():
+            transport_owner = getattr(source, "transport_owner_profile", None)
+            transport_platform = _normalize_transport_platform(
+                getattr(source, "transport_platform", None)
             )
-            return self._authorization_adapter(
-                transport_platform,
-                None if owner_profile in {None, "default"} else owner_profile,
-            )
-        if isinstance(transport_owner, str) and transport_owner.strip():
-            owner_profile = transport_owner.strip()
-            return self._authorization_adapter(
-                getattr(source, "platform", None),
-                None if owner_profile == "default" else owner_profile,
-            )
+            if transport_platform is not None:
+                owner_profile = (
+                    transport_owner.strip()
+                    if isinstance(transport_owner, str) and transport_owner.strip()
+                    else None
+                )
+                return self._authorization_adapter(
+                    transport_platform,
+                    None if owner_profile in {None, "default"} else owner_profile,
+                )
+            if isinstance(transport_owner, str) and transport_owner.strip():
+                owner_profile = transport_owner.strip()
+                return self._authorization_adapter(
+                    getattr(source, "platform", None),
+                    None if owner_profile == "default" else owner_profile,
+                )
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
@@ -224,10 +236,11 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
-        transport_owner = getattr(source, "transport_owner_profile", None)
-        if isinstance(transport_owner, str) and transport_owner.strip():
-            owner_profile = transport_owner.strip()
-            return None if owner_profile == "default" else owner_profile
+        if self._profile_switching_provenance_enabled():
+            transport_owner = getattr(source, "transport_owner_profile", None)
+            if isinstance(transport_owner, str) and transport_owner.strip():
+                owner_profile = transport_owner.strip()
+                return None if owner_profile == "default" else owner_profile
         return getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(
@@ -448,12 +461,14 @@ class GatewayAuthorizationMixin:
             return True
 
         adapter_profile = self._adapter_profile_for_source(source)
-        authorization_platform = (
-            _normalize_transport_platform(
-                getattr(source, "transport_platform", None)
+        authorization_platform = source.platform
+        if self._profile_switching_provenance_enabled():
+            authorization_platform = (
+                _normalize_transport_platform(
+                    getattr(source, "transport_platform", None)
+                )
+                or source.platform
             )
-            or source.platform
-        )
 
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this

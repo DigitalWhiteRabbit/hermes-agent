@@ -182,12 +182,6 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
-    # Profile whose live adapter admitted this message. This remains separate
-    # from ``profile`` because dynamic routing changes the runtime/session
-    # namespace without changing which bot account owns replies. Optional for
-    # backward compatibility: legacy persisted sources fall back to the
-    # historical runtime-profile adapter lookup.
-    transport_owner_profile: Optional[str] = None
     # Transport-local fail-closed signal for an explicit profile route whose
     # target is not served. Excluded from repr/equality and wire serialization.
     profile_route_rejected: bool = field(default=False, repr=False, compare=False)
@@ -224,6 +218,13 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+    # Profile whose live adapter admitted this message. This remains separate
+    # from ``profile`` because dynamic routing changes the runtime/session
+    # namespace without changing which bot account owns replies. Optional for
+    # backward compatibility: legacy persisted sources fall back to the
+    # historical runtime-profile adapter lookup. Both provenance fields stay
+    # at the end so older positional constructors retain every field index.
+    transport_owner_profile: Optional[str] = None
     # Platform/kind of the adapter that admitted this message. Relay ingress
     # deliberately keeps the underlying platform in ``platform`` for session
     # namespacing, so owner profile alone cannot recover the transport after a
@@ -1359,6 +1360,64 @@ class SessionStore:
         )
         self._open_session_db_for_active_scope()
 
+    def _transport_provenance_enabled(self) -> bool:
+        """Return whether dynamic transport provenance is part of persistence."""
+        return (
+            getattr(getattr(self.config, "profile_switching", None), "enabled", False)
+            is True
+        )
+
+    def _source_for_persistence(self, source: SessionSource) -> SessionSource:
+        """Preserve the pre-feature wire shape while profile switching is off."""
+        if self._transport_provenance_enabled():
+            return source
+        if (
+            getattr(source, "transport_owner_profile", None) is None
+            and getattr(source, "transport_platform", None) is None
+        ):
+            return source
+        persisted = replace(source)
+        # ``replace`` invokes __post_init__, which may infer Relay again from
+        # the in-process trust bit. Clear only the two new durable provenance
+        # fields after construction; the trust bit itself was already wire-
+        # invisible before this feature and remains live-turn state.
+        persisted.transport_owner_profile = None
+        persisted.transport_platform = None
+        return persisted
+
+    def _entry_from_dict(self, data: Dict[str, Any]) -> SessionEntry:
+        entry = SessionEntry.from_dict(data)
+        if entry.origin is not None:
+            entry.origin = self._source_for_persistence(entry.origin)
+        return entry
+
+    def _refresh_dynamic_origin_for_turn(
+        self,
+        entry: SessionEntry,
+        source: SessionSource,
+    ) -> None:
+        """Durably refresh feature-on origin/provenance for every accepted turn."""
+        if not self._transport_provenance_enabled():
+            return
+        with self._lock:
+            current = self._entries.get(entry.session_key)
+            if current is None or current.session_id != entry.session_id:
+                return
+            current.origin = source
+            current.platform = source.platform
+            current.chat_type = source.chat_type
+            current.display_name = source.chat_name
+        # Origin affects both the primary routing row and the compatibility
+        # JSON mirror, so this is deliberately a structural save rather than
+        # the metadata-only single-row fast path.
+        self._save_entries()
+        self._record_gateway_session_peer(
+            entry.session_id,
+            entry.session_key,
+            source,
+            display_name=source.chat_name,
+        )
+
     def _open_session_db_for_active_scope(self):
         """Return the SessionDB for the profile scope active on this task.
 
@@ -1511,7 +1570,7 @@ class SessionStore:
                         try:
                             entry_data = json.loads(entry_json)
                             if isinstance(entry_data, dict):
-                                self._entries[key] = SessionEntry.from_dict(entry_data)
+                                self._entries[key] = self._entry_from_dict(entry_data)
                         except (ValueError, KeyError, TypeError) as e:
                             logger.warning(
                                 "Skipping invalid routing entry %r: %s", key, e
@@ -1553,7 +1612,7 @@ class SessionStore:
                         )
                         continue
                     try:
-                        self._entries[key] = SessionEntry.from_dict(entry_data)
+                        self._entries[key] = self._entry_from_dict(entry_data)
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning("Skipping invalid session entry %r: %s", key, e)
@@ -1728,7 +1787,7 @@ class SessionStore:
                 entry_data = json.loads(entry_json)
                 if not isinstance(entry_data, dict):
                     continue
-                durable_entry = SessionEntry.from_dict(entry_data)
+                durable_entry = self._entry_from_dict(entry_data)
             except (ValueError, KeyError, TypeError) as exc:
                 logger.warning("Skipping invalid routing entry %r: %s", key, exc)
                 continue
@@ -2351,6 +2410,7 @@ class SessionStore:
         """Persist the routing peer for an existing gateway session row."""
         if not self._db or not source:
             return
+        source = self._source_for_persistence(source)
         recorder = getattr(self._db, "record_gateway_session_peer", None)
         if not callable(recorder):
             return
@@ -2680,6 +2740,7 @@ class SessionStore:
             if slot.error is not None:
                 raise slot.error
             assert slot.result is not None
+            self._refresh_dynamic_origin_for_turn(slot.result, source)
             if touch_activity:
                 self.update_session(slot.result.session_key)
             return slot.result
@@ -2690,6 +2751,7 @@ class SessionStore:
                 force_new=force_new,
                 touch_activity=touch_activity,
             )
+            self._refresh_dynamic_origin_for_turn(result, source)
             slot.result = result
             return result
         except BaseException as exc:
@@ -2714,6 +2776,7 @@ class SessionStore:
         """
         session_key = self._generate_session_key(source)
         now = _now()
+        persisted_source = self._source_for_persistence(source)
 
         # One-time routing-index migration for Slack sessions created before
         # workspace scope was part of the key. Move (rather than copy) the
@@ -2748,7 +2811,7 @@ class SessionStore:
                     if adopt and self._claim_legacy_slack_key(legacy_key):
                         migrated_legacy_entry = self._entries.pop(legacy_key)
                         migrated_legacy_entry.session_key = session_key
-                        migrated_legacy_entry.origin = source
+                        migrated_legacy_entry.origin = persisted_source
                         migrated_legacy_entry.platform = source.platform
                         migrated_legacy_entry.chat_type = source.chat_type
                         self._entries[session_key] = migrated_legacy_entry
@@ -2947,7 +3010,7 @@ class SessionStore:
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
-                origin=source,
+                origin=persisted_source,
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
@@ -2971,7 +3034,7 @@ class SessionStore:
             _needs_save = True
             if entry is candidate:
                 try:
-                    _origin_json = json.dumps(source.to_dict())
+                    _origin_json = json.dumps(persisted_source.to_dict())
                 except Exception:
                     _origin_json = None
                 db_create_kwargs = {
@@ -3037,7 +3100,7 @@ class SessionStore:
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
-                    source,
+                    persisted_source,
                     display_name=entry.display_name,
                 )
             except Exception as e:

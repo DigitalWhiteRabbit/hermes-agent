@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from gateway.config import ProfileSwitchingConfig
 from gateway.profile_switching.models import PolicyDecision, ReasonCode, ScopeKey
@@ -15,11 +15,24 @@ class ProfilePolicy:
         *,
         served_profiles: Iterable[str],
         existing_profiles: Iterable[str],
+        profile_exists_now: Callable[[str], bool] | None = None,
+        profile_served_now: Callable[[str], bool] | None = None,
     ) -> None:
         self._config = config
         self._served_profiles = frozenset(served_profiles)
         self._existing_profiles = frozenset(existing_profiles)
+        self._profile_exists_now = profile_exists_now
+        self._profile_served_now = profile_served_now
         self._rules_by_profile = {rule.profile: rule for rule in config.rules}
+
+    @staticmethod
+    def _current(check: Callable[[str], bool] | None, profile_name: str) -> bool:
+        if check is None:
+            return True
+        try:
+            return check(profile_name) is True
+        except Exception:
+            return False
 
     def evaluate(
         self,
@@ -27,9 +40,13 @@ class ProfilePolicy:
         scope: ScopeKey,
         actor_user_id: str,
     ) -> PolicyDecision:
-        if profile_name not in self._existing_profiles:
+        if profile_name not in self._existing_profiles or not self._current(
+            self._profile_exists_now, profile_name
+        ):
             return PolicyDecision(False, ReasonCode.PROFILE_UNKNOWN)
-        if profile_name not in self._served_profiles:
+        if profile_name not in self._served_profiles or not self._current(
+            self._profile_served_now, profile_name
+        ):
             return PolicyDecision(False, ReasonCode.PROFILE_UNSERVED)
         if profile_name in self._config.hidden:
             return PolicyDecision(False, ReasonCode.PROFILE_HIDDEN)

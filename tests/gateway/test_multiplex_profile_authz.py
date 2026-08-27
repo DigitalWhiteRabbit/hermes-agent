@@ -5,7 +5,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import (
+    GatewayConfig,
+    Platform,
+    PlatformConfig,
+    ProfileSwitchingConfig,
+)
 from gateway.session import SessionSource
 
 
@@ -56,7 +61,10 @@ def _make_transport_lookup_runner():
         Platform.RELAY: relay,
     }
     runner._profile_adapters = {}
-    runner.config = GatewayConfig()
+    runner.config = GatewayConfig(
+        multiplex_profiles=True,
+        profile_switching=ProfileSwitchingConfig(enabled=True),
+    )
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     runner.pairing_store._is_rate_limited.return_value = False
@@ -148,6 +156,31 @@ def test_relay_delivery_marker_preserves_relay_adapter_with_invalid_provenance()
     source.delivered_via_upstream_relay = True
 
     assert runner._adapter_for_source(source) is relay
+
+
+def test_feature_off_ignores_transport_provenance_for_adapter_and_auth(
+    monkeypatch,
+):
+    for key in (
+        "TELEGRAM_ALLOWED_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    runner, _native, _discord, relay = _make_transport_lookup_runner()
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    secondary = SimpleNamespace(
+        authorization_is_upstream=False,
+        enforces_own_access_policy=False,
+    )
+    runner._profile_adapters = {"coder": {Platform.TELEGRAM: secondary}}
+    source = _transport_source(Platform.RELAY)
+    source.profile = "coder"
+
+    assert runner._adapter_for_source(source) is secondary
+    assert runner._adapter_for_source(source) is not relay
+    assert runner._is_user_authorized(source) is False
 
 
 def _make_multiplex_runner(monkeypatch):

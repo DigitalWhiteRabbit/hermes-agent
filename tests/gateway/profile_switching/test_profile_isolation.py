@@ -199,6 +199,7 @@ def profile_fixture(tmp_path, monkeypatch):
     runner = object.__new__(GatewayRunner)
     runner.config = config
     runner._profile_switching_service = service
+    runner._is_user_authorized_for_source = lambda _source: True
     primary_adapter = _StubAdapter(
         PlatformConfig(enabled=True),
         Platform.TELEGRAM,

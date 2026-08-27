@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import os
+from collections import Counter, deque
 from pathlib import Path
+from typing import Never
 
 from hermes_cli.profiles import normalize_profile_name, validate_profile_name
 
@@ -13,7 +17,11 @@ from .models import (
 )
 from .policy import ProfilePolicy
 from .resolver import ProfileResolver
-from .store import ProfileBindingChanged, ProfileRoutingStore
+from .store import (
+    ProfileBindingChanged,
+    ProfileRoutingStore,
+    ProfileRoutingStoreUnavailable,
+)
 
 
 _CLEAR_RETRY_LIMIT = 3
@@ -41,6 +49,86 @@ class InvalidProfileScope(ProfileSwitchError):
         super().__init__("thread profile scope requires a thread id")
 
 
+class _UnavailableRoutingStore(ProfileRoutingStore):
+    """DB-less degraded store: every dynamic operation fails closed."""
+
+    def __init__(self) -> None:
+        # This implementation deliberately has no SQLite state. Every store
+        # operation used by the service/resolver is replaced by ``_raise``.
+        pass
+
+    @staticmethod
+    def _raise() -> Never:
+        raise ProfileRoutingStoreUnavailable("profile routing database unavailable")
+
+    def claim_once(self, scope: ScopeKey) -> ProfileBinding | None:
+        self._raise()
+
+    def get_binding(
+        self,
+        scope: ScopeKey,
+        scope_kind: ScopeKind,
+    ) -> ProfileBinding | None:
+        self._raise()
+
+    def set_binding_with_audit(
+        self,
+        scope: ScopeKey,
+        scope_kind: ScopeKind,
+        *,
+        profile_name: str,
+        created_by_user_id: str,
+        source: str,
+        expires_at: float | None = None,
+    ) -> ProfileBinding:
+        self._raise()
+
+    def set_once_with_audit(
+        self,
+        scope: ScopeKey,
+        *,
+        profile_name: str,
+        created_by_user_id: str,
+        source: str,
+        expires_at: float | None = None,
+    ) -> ProfileBinding:
+        self._raise()
+
+    def clear_binding_with_audit(
+        self,
+        scope: ScopeKey,
+        scope_kind: ScopeKind,
+        *,
+        expected_version: int | None,
+        expected_profile: str | None,
+        actor_user_id: str,
+        source: str,
+    ) -> bool:
+        self._raise()
+
+    def append_audit(
+        self,
+        *,
+        actor_user_id: str,
+        scope: ScopeKey,
+        old_profile: str | None,
+        new_profile: str | None,
+        scope_kind: ScopeKind | None,
+        source: str,
+        result: str,
+        reason_code: ReasonCode,
+    ) -> None:
+        self._raise()
+
+    def record_session(
+        self,
+        scope: ScopeKey,
+        profile_name: str,
+        session_id: str,
+    ) -> None:
+        self._raise()
+
+
 class ProfileSwitchingService:
     """Validate, authorize, and persist profile-routing operations."""
 
@@ -48,10 +136,50 @@ class ProfileSwitchingService:
         self,
         store: ProfileRoutingStore,
         policy: ProfilePolicy,
+        *,
+        resolution_audit_limit: int = 1_000,
     ) -> None:
         self._store = store
         self._policy = policy
         self._resolver = ProfileResolver(store, policy)
+        limit = max(1, min(int(resolution_audit_limit), 1_000))
+        self._resolution_audit = deque(maxlen=limit)
+        self._resolution_metrics: Counter[str] = Counter()
+
+    @property
+    def resolution_audit(self) -> list[dict[str, str | None]]:
+        return list(self._resolution_audit)
+
+    @property
+    def resolution_metrics(self) -> dict[str, int]:
+        return dict(self._resolution_metrics)
+
+    @staticmethod
+    def _redact(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+    def _record_resolution_diagnostic(
+        self,
+        *,
+        scope: ScopeKey,
+        actor_user_id: str,
+        source,
+        profile_name: str | None,
+        reason: ReasonCode,
+    ) -> None:
+        self._resolution_metrics[reason.value] += 1
+        self._resolution_audit.append({
+            "reason_code": reason.value,
+            "source": source.value if source is not None else None,
+            "platform": scope.platform,
+            "account_hash": self._redact(scope.account_id),
+            "chat_hash": self._redact(scope.chat_id),
+            "thread_hash": self._redact(scope.thread_id),
+            "actor_hash": self._redact(actor_user_id),
+            "profile_hash": self._redact(profile_name),
+        })
 
     @classmethod
     def from_gateway_config(
@@ -61,24 +189,70 @@ class ProfileSwitchingService:
         db_path: Path,
     ) -> "ProfileSwitchingService":
         """Build the routing service from the gateway's authoritative profiles."""
+        policy = cls._policy_from_gateway_config(config)
+        store = ProfileRoutingStore(Path(db_path))
+        return cls(
+            store,
+            policy,
+            resolution_audit_limit=config.profile_switching.audit_max_rows,
+        )
+
+    @classmethod
+    def degraded_from_gateway_config(cls, config) -> "ProfileSwitchingService":
+        """Build a policy-complete service whose dynamic store is unavailable."""
+        policy = cls._policy_from_gateway_config(config)
+        return cls(
+            _UnavailableRoutingStore(),
+            policy,
+            resolution_audit_limit=config.profile_switching.audit_max_rows,
+        )
+
+    @staticmethod
+    def _policy_from_gateway_config(config) -> ProfilePolicy:
+        """Build current-profile checks independently from SQLite availability."""
         from gateway.run import _multiplex_profile_homes
-        from hermes_cli.profiles import list_profile_names, profile_exists
+        from hermes_cli.profiles import (
+            get_profile_dir,
+            list_profile_names,
+            profile_exists,
+        )
 
         existing_profiles = {
             name for name in list_profile_names() if profile_exists(name)
         }
         existing_profiles.add("default")
-        served_profiles = {
-            name for name, _home in _multiplex_profile_homes(config)
-        }
+        served_profiles = {name for name, _home in _multiplex_profile_homes(config)}
         served_profiles.add("default")
-        store = ProfileRoutingStore(Path(db_path))
-        policy = ProfilePolicy(
+
+        def accessible(home: Path) -> bool:
+            try:
+                return home.is_dir() and os.access(home, os.R_OK | os.X_OK)
+            except OSError:
+                return False
+
+        def profile_exists_now(profile_name: str) -> bool:
+            try:
+                return profile_exists(profile_name) and accessible(
+                    get_profile_dir(profile_name)
+                )
+            except (OSError, ValueError):
+                return False
+
+        def profile_served_now(profile_name: str) -> bool:
+            try:
+                current = dict(_multiplex_profile_homes(config))
+                home = current.get(profile_name)
+                return home is not None and accessible(Path(home))
+            except (OSError, ValueError):
+                return False
+
+        return ProfilePolicy(
             config.profile_switching,
             served_profiles=served_profiles,
             existing_profiles=existing_profiles,
+            profile_exists_now=profile_exists_now,
+            profile_served_now=profile_served_now,
         )
-        return cls(store, policy)
 
     @staticmethod
     def _profile_name(profile_name: str) -> str:
@@ -325,6 +499,15 @@ class ProfileSwitchingService:
             actor_user_id=actor_user_id,
             consume_once=consume_once,
             static_profile=static_profile,
+            on_diagnostic=lambda source, profile_name, reason: (
+                self._record_resolution_diagnostic(
+                    scope=scope,
+                    actor_user_id=actor_user_id,
+                    source=source,
+                    profile_name=profile_name,
+                    reason=reason,
+                )
+            ),
         )
 
     def note_session(

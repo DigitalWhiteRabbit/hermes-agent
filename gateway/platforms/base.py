@@ -6199,12 +6199,15 @@ class BasePlatformAdapter(ABC):
         # idempotent safety net and preserve their transport authorization
         # homes independently from the resolved runtime profile.
         runner = getattr(self, "gateway_runner", None)
-        dynamic_service = (
-            vars(runner).get("_profile_switching_service")
-            if runner is not None
-            else None
+        dynamic_enabled = (
+            getattr(
+                getattr(getattr(runner, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
         )
-        if dynamic_service is not None:
+        if dynamic_enabled:
             owner_profile = getattr(self, "_owner_profile", None)
             if isinstance(owner_profile, str) and owner_profile.strip():
                 # A secondary adapter is a distinct transport account. Until
@@ -6223,6 +6226,8 @@ class BasePlatformAdapter(ABC):
                     resolution = resolve_profile(event)
                     if inspect.isawaitable(resolution):
                         await resolution
+                    if getattr(event.source, "_profile_transport_drop", False):
+                        return
 
         session_key = build_session_key(
             event.source,

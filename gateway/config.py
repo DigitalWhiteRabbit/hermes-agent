@@ -979,9 +979,8 @@ class ProfileSwitchingConfig:
         }
         unknown_keys = set(raw) - allowed_keys
         if unknown_keys:
-            raise ValueError(
-                f"unknown profile_switching keys: {sorted(unknown_keys)}"
-            )
+            rendered = sorted(f"{type(key).__name__}:{key!r}" for key in unknown_keys)
+            raise ValueError(f"unknown profile_switching keys: {rendered}")
 
         def positive_int(key: str, default: int) -> int:
             if key not in raw:
@@ -1025,18 +1024,19 @@ class ProfileSwitchingConfig:
                 raise ValueError(f"{key} must be a list")
             normalized = []
             for item in value:
-                if isinstance(item, (dict, list, tuple, set)) or item is None:
+                if isinstance(item, (bool, dict, list, tuple, set)) or item is None:
                     raise ValueError(f"{key} contains an invalid ID")
-                normalized.append(str(item))
+                normalized_id = str(item).strip()
+                if not normalized_id:
+                    raise ValueError(f"{key} contains an invalid ID")
+                normalized.append(normalized_id)
             return tuple(normalized)
 
         admins_raw = raw.get("admins", {})
         if not isinstance(admins_raw, dict):
             raise ValueError("profile_switching.admins must be a mapping")
         admins = {
-            str(platform): id_list(
-                ids, f"profile_switching.admins.{platform}"
-            )
+            str(platform): id_list(ids, f"profile_switching.admins.{platform}")
             for platform, ids in admins_raw.items()
         }
 
@@ -1051,45 +1051,80 @@ class ProfileSwitchingConfig:
         if not isinstance(rules_raw, (list, tuple)):
             raise ValueError("profile_switching.rules must be a list")
         rules = []
+        rule_profiles: set[str] = set()
         for index, rule_raw in enumerate(rules_raw):
             if not isinstance(rule_raw, dict):
                 raise ValueError(f"profile_switching.rules[{index}] must be a mapping")
             rule_unknown_keys = set(rule_raw) - rule_allowed_keys
             if rule_unknown_keys:
-                raise ValueError(
-                    "unknown profile_switching rule keys: "
-                    f"{sorted(rule_unknown_keys)}"
+                rendered = sorted(
+                    f"{type(key).__name__}:{key!r}" for key in rule_unknown_keys
                 )
+                raise ValueError(f"unknown profile_switching rule keys: {rendered}")
             if "profile" not in rule_raw:
                 raise ValueError(
                     f"profile_switching.rules[{index}].profile is required"
                 )
             profile = normalize_profile_name(rule_raw["profile"])
             validate_profile_name(profile)
+            if profile in rule_profiles:
+                raise ValueError(
+                    f"duplicate profile_switching rule for profile {profile!r}"
+                )
+            rule_profiles.add(profile)
+            users = id_list(
+                rule_raw.get("users", ()),
+                f"profile_switching.rules[{index}].users",
+            )
+            chats = id_list(
+                rule_raw.get("chats", ()),
+                f"profile_switching.rules[{index}].chats",
+            )
+            threads = id_list(
+                rule_raw.get("threads", ()),
+                f"profile_switching.rules[{index}].threads",
+            )
+            if threads and (not chats or "*" in chats):
+                raise ValueError(
+                    f"profile_switching.rules[{index}].threads requires "
+                    "concrete chat IDs and cannot use wildcard chats"
+                )
+            require_confirmation = _coerce_bool(
+                rule_raw.get("require_confirmation"), False
+            )
+            if require_confirmation:
+                raise ValueError(
+                    f"profile_switching.rules[{index}].require_confirmation=true "
+                    "is unsupported in Milestone 1"
+                )
             rules.append(
                 ProfileSwitchRule(
                     profile=profile,
-                    users=id_list(
-                        rule_raw.get("users", ()),
-                        f"profile_switching.rules[{index}].users",
-                    ),
-                    chats=id_list(
-                        rule_raw.get("chats", ()),
-                        f"profile_switching.rules[{index}].chats",
-                    ),
-                    threads=id_list(
-                        rule_raw.get("threads", ()),
-                        f"profile_switching.rules[{index}].threads",
-                    ),
-                    require_confirmation=_coerce_bool(
-                        rule_raw.get("require_confirmation"), False
-                    ),
+                    users=users,
+                    chats=chats,
+                    threads=threads,
+                    require_confirmation=False,
                 )
             )
 
         enabled = _coerce_bool(raw.get("enabled"), False)
         default_visible = profile_names("default_visible")
         hidden = profile_names("hidden")
+        high_risk_profiles = {"finance", "security", "production"}
+        served_high_risk = (
+            high_risk_profiles & set(multiplex_profile_allowlist or ())
+            if enabled
+            else set()
+        )
+        visible_high_risk = high_risk_profiles & set(default_visible)
+        rule_high_risk = high_risk_profiles & {rule.profile for rule in rules}
+        prohibited = served_high_risk | visible_high_risk | rule_high_risk
+        if prohibited:
+            profile = sorted(prohibited)[0]
+            raise ValueError(
+                f"profile {profile!r} cannot be served, visible, or switched "
+                "in Milestone 1; it may only be named in profile_switching.hidden"
+            )
         overlap = set(default_visible) & set(hidden)
         if overlap:
             raise ValueError(
@@ -1327,14 +1362,10 @@ class GatewayConfig:
         return self.default_reset_policy
     
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "platforms": {
-                p.value: c.to_dict() for p, c in self.platforms.items()
-            },
+        result = {
+            "platforms": {p.value: c.to_dict() for p, c in self.platforms.items()},
             "default_reset_policy": self.default_reset_policy.to_dict(),
-            "reset_by_type": {
-                k: v.to_dict() for k, v in self.reset_by_type.items()
-            },
+            "reset_by_type": {k: v.to_dict() for k, v in self.reset_by_type.items()},
             "reset_by_platform": {
                 p.value: v.to_dict() for p, v in self.reset_by_platform.items()
             },
@@ -1351,7 +1382,6 @@ class GatewayConfig:
             "max_concurrent_sessions": self.max_concurrent_sessions,
             "multiplex_profiles": self.multiplex_profiles,
             "multiplex_profile_allowlist": self.multiplex_profile_allowlist,
-            "profile_switching": self.profile_switching.to_dict(),
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "loop_watchdog_probe_interval_s": self.loop_watchdog_probe_interval_s,
@@ -1365,7 +1395,12 @@ class GatewayConfig:
                 for r in self.profile_routes
             ],
         }
-    
+        # Preserve the pre-feature serialized config shape by default. An
+        # explicit feature-on config remains fully round-trippable.
+        if self.profile_switching.enabled:
+            result["profile_switching"] = self.profile_switching.to_dict()
+        return result
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "GatewayConfig":
         data = _coerce_dict(data)
