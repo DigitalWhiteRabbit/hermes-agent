@@ -12554,24 +12554,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message, or when the platform reconnects — the reconnect watcher
         calls this again scoped to that ``platform``.
 
-        ``platform`` (a ``Platform``) restricts the pass to sessions that
-        originated on that platform.  The reconnect path passes it so a
-        platform coming back online retries only its own sessions and never
-        re-touches another platform's in-flight recoveries.  Sessions whose
-        agent is already running are skipped regardless, so a session
-        scheduled at startup is never resumed a second time.
+        ``platform`` (a ``Platform``) restricts the pass to sessions owned by
+        that transport. Relay sources retain their underlying Discord/Slack/etc.
+        platform for session keys, so reconnect filtering prefers durable
+        ``transport_platform`` provenance and falls back to ``source.platform``
+        for legacy or invalid rows. Sessions whose agent is already running are
+        skipped regardless, so a session scheduled at startup is never resumed
+        a second time.
         """
         window = _auto_continue_freshness_window()
+
+        def _resume_transport_platform(source: SessionSource) -> Optional[Platform]:
+            transport_platform = getattr(source, "transport_platform", None)
+            if transport_platform is not None:
+                try:
+                    return Platform(transport_platform)
+                except (TypeError, ValueError):
+                    pass
+            return getattr(source, "platform", None)
+
         try:
             with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
                 self.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
+                    entry
+                    for entry in self.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
                     and entry.resume_reason in self._AUTO_RESUME_REASONS
-                    and (platform is None or entry.origin.platform == platform)
+                    and (
+                        platform is None
+                        or _resume_transport_platform(entry.origin) == platform
+                    )
                 ]
         except Exception as exc:
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
