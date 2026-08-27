@@ -1817,6 +1817,7 @@ class TestGatewayRoutingTable:
             profile_switching=ProfileSwitchingConfig(enabled=True),
         )
         store = SessionStore(sessions_dir=tmp_path, config=config)
+        prior_updated_at = datetime(2000, 1, 2, 3, 4, 5)
 
         def source(name, transport):
             value = self._source()
@@ -1844,8 +1845,12 @@ class TestGatewayRoutingTable:
 
         def blocked_impl(incoming, *args, **kwargs):
             if incoming.chat_name == "owner":
+                result = original_impl(incoming, *args, **kwargs)
+                with store._lock:
+                    result.updated_at = prior_updated_at
                 owner_in_impl.set()
                 assert release_owner.wait(timeout=10)
+                return result
             return original_impl(incoming, *args, **kwargs)
 
         def ordered_record(session_id, session_key, incoming, *args, **kwargs):
@@ -1911,12 +1916,20 @@ class TestGatewayRoutingTable:
         assert live.origin is source_b
         assert live.origin.transport_platform == final_transport
         assert live.display_name == "relay-B"
+        if touch_activity:
+            assert live.updated_at > prior_updated_at
+        else:
+            assert live.updated_at == prior_updated_at
 
         sessions_json = json.loads((tmp_path / "sessions.json").read_text())
         json_entry = SessionEntry.from_dict(sessions_json[session_key])
         assert json_entry.origin is not None
         assert json_entry.origin.transport_platform == final_transport
         assert json_entry.display_name == "relay-B"
+        if touch_activity:
+            assert json_entry.updated_at > prior_updated_at
+        else:
+            assert json_entry.updated_at == prior_updated_at
 
         routing_rows = store._db.load_gateway_routing_entries(
             scope=store._routing_scope()
@@ -1925,6 +1938,10 @@ class TestGatewayRoutingTable:
         assert routing_entry.origin is not None
         assert routing_entry.origin.transport_platform == final_transport
         assert routing_entry.display_name == "relay-B"
+        if touch_activity:
+            assert routing_entry.updated_at > prior_updated_at
+        else:
+            assert routing_entry.updated_at == prior_updated_at
 
         session_row = store._db.get_session(owner.session_id)
         assert session_row is not None
@@ -1943,6 +1960,162 @@ class TestGatewayRoutingTable:
         peer_origin = json.loads(peer_lookup["origin_json"])
         assert peer_origin["transport_platform"] == final_transport.value
         assert peer_lookup["display_name"] == "relay-B"
+
+    def test_feature_on_update_session_cannot_regress_newer_origin_commit(
+        self, tmp_path
+    ):
+        """A stale metadata writer cannot overwrite a completed origin commit."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        source_a = self._source()
+        source_a.profile = "coder"
+        source_a.chat_name = "native-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        entry = store.get_or_create_session(source_a)
+
+        source_b = self._source()
+        source_b.profile = "coder"
+        source_b.chat_name = "relay-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        update_at_peer = threading.Event()
+        release_update = threading.Event()
+        update_has_serializer = threading.Event()
+        refresh_attempted_serializer = threading.Event()
+        actor = threading.local()
+        original_acquire = store._acquire_origin_refresh_lock
+        original_record = store._record_gateway_session_peer
+
+        def observed_acquire(session_key):
+            label = getattr(actor, "label", None)
+            if label == "refresh":
+                refresh_attempted_serializer.set()
+            keyed = original_acquire(session_key)
+            if label == "update":
+                update_has_serializer.set()
+            return keyed
+
+        def blocked_record(session_id, session_key, incoming, *args, **kwargs):
+            if getattr(actor, "label", None) == "update":
+                update_at_peer.set()
+                assert release_update.wait(timeout=10)
+            return original_record(
+                session_id, session_key, incoming, *args, **kwargs
+            )
+
+        store._acquire_origin_refresh_lock = observed_acquire  # type: ignore[method-assign]
+        store._record_gateway_session_peer = blocked_record  # type: ignore[method-assign]
+
+        def update():
+            actor.label = "update"
+            store.update_session(entry.session_key, last_prompt_tokens=17)
+
+        def refresh():
+            actor.label = "refresh"
+            store._refresh_dynamic_origin_for_turn(entry, source_b)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            update_future = pool.submit(update)
+            assert update_at_peer.wait(timeout=10)
+            refresh_future = pool.submit(refresh)
+            assert refresh_attempted_serializer.wait(timeout=10)
+            if update_has_serializer.is_set():
+                # Fixed path: update owns the key and refresh is queued behind it.
+                release_update.set()
+            else:
+                # Buggy path: refresh can complete while update holds stale A.
+                refresh_future.result(timeout=10)
+                release_update.set()
+            update_future.result(timeout=10)
+            refresh_future.result(timeout=10)
+
+        live = store._entries[entry.session_key]
+        assert live.origin is source_b
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing = SessionEntry.from_dict(
+            json.loads(routing_rows[entry.session_key])
+        )
+        row = store._db.get_session(entry.session_id)
+        assert row is not None
+        assert routing.origin is not None
+        assert routing.origin.transport_platform == Platform.RELAY
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+        assert row["display_name"] == "relay-B"
+
+    @pytest.mark.parametrize("failure_point", ["routing", "json", "peer"])
+    def test_origin_commit_failure_is_signaled_and_retry_heals_all_views(
+        self, tmp_path, failure_point
+    ):
+        """A partial provenance write is never reported as a successful commit."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source_a = self._source()
+        source_a.profile = "coder"
+        source_a.chat_name = "native-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        entry = store.get_or_create_session(source_a)
+
+        source_b = self._source()
+        source_b.profile = "coder"
+        source_b.chat_name = "relay-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        if failure_point == "routing":
+            target = store._db
+            name = "replace_gateway_routing_entries"
+        elif failure_point == "json":
+            target = store
+            name = "_save_sessions_json"
+        else:
+            target = store._db
+            name = "record_gateway_session_peer"
+        original = getattr(target, name)
+        failed = False
+
+        def fail_once(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise RuntimeError(f"injected {failure_point} failure")
+            return original(*args, **kwargs)
+
+        setattr(target, name, fail_once)
+        with pytest.raises(RuntimeError, match="origin provenance persistence failed"):
+            store._refresh_dynamic_origin_for_turn(entry, source_b)
+        assert store._origin_refresh_registry == {}
+
+        store._refresh_dynamic_origin_for_turn(entry, source_b)
+
+        sessions_json = json.loads((tmp_path / "sessions.json").read_text())
+        json_entry = SessionEntry.from_dict(sessions_json[entry.session_key])
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing_entry = SessionEntry.from_dict(
+            json.loads(routing_rows[entry.session_key])
+        )
+        row = store._db.get_session(entry.session_id)
+        assert row is not None
+        assert store._entries[entry.session_key].origin is source_b
+        assert json_entry.origin is not None
+        assert json_entry.origin.transport_platform == Platform.RELAY
+        assert routing_entry.origin is not None
+        assert routing_entry.origin.transport_platform == Platform.RELAY
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+        assert row["display_name"] == "relay-B"
 
     def test_adjacent_flight_cannot_overtake_old_origin_waiter(self, tmp_path):
         config = GatewayConfig(
@@ -2023,6 +2196,85 @@ class TestGatewayRoutingTable:
         assert row is not None
         assert json.loads(row["origin_json"])["transport_platform"] == "relay"
 
+    def test_origin_serializer_commits_queued_callers_in_arrival_order(
+        self, tmp_path
+    ):
+        """A later adjacent owner cannot barge ahead of an old queued waiter."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        initial = self._source()
+        initial.profile = "coder"
+        initial.chat_name = "initial"
+        initial.transport_owner_profile = "default"
+        initial.transport_platform = Platform.TELEGRAM
+        entry = store.get_or_create_session(initial)
+
+        def source(name, transport):
+            value = self._source()
+            value.profile = "coder"
+            value.chat_name = name
+            value.transport_owner_profile = "default"
+            value.transport_platform = transport
+            return value
+
+        old_source = source("old-waiter", Platform.TELEGRAM)
+        adjacent_source = source("adjacent-flight", Platform.RELAY)
+        old_attempted = threading.Event()
+        adjacent_attempted = threading.Event()
+        actor = threading.local()
+        commit_order = []
+        original_acquire = store._acquire_origin_refresh_lock
+        original_record = store._record_gateway_session_peer
+
+        def observed_acquire(session_key):
+            if actor.label == "old-waiter":
+                old_attempted.set()
+            elif actor.label == "adjacent-flight":
+                adjacent_attempted.set()
+            return original_acquire(session_key)
+
+        def observed_record(session_id, session_key, incoming, *args, **kwargs):
+            result = original_record(
+                session_id, session_key, incoming, *args, **kwargs
+            )
+            if incoming is not None and incoming.chat_name in {
+                "old-waiter",
+                "adjacent-flight",
+            }:
+                commit_order.append(incoming.chat_name)
+            return result
+
+        store._acquire_origin_refresh_lock = observed_acquire  # type: ignore[method-assign]
+        store._record_gateway_session_peer = observed_record  # type: ignore[method-assign]
+        owner_lock = original_acquire(entry.session_key)
+
+        def refresh(label, incoming):
+            actor.label = label
+            store._refresh_dynamic_origin_for_turn(entry, incoming)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                old_future = pool.submit(refresh, "old-waiter", old_source)
+                assert old_attempted.wait(timeout=10)
+                adjacent_future = pool.submit(
+                    refresh, "adjacent-flight", adjacent_source
+                )
+                assert adjacent_attempted.wait(timeout=10)
+                store._release_origin_refresh_lock(entry.session_key, owner_lock)
+                owner_lock = None
+                old_future.result(timeout=10)
+                adjacent_future.result(timeout=10)
+        finally:
+            if owner_lock is not None:
+                store._release_origin_refresh_lock(entry.session_key, owner_lock)
+
+        assert commit_order == ["old-waiter", "adjacent-flight"]
+        assert store._origin_refresh_registry == {}
+
     def test_blocked_origin_commit_for_one_key_does_not_block_another_key(
         self, tmp_path
     ):
@@ -2047,7 +2299,7 @@ class TestGatewayRoutingTable:
         b_at_persistence = threading.Event()
         original_persist = store._persist_routing_data
 
-        def ordered_persist(data, generation):
+        def ordered_persist(data, generation, **kwargs):
             names = {
                 item.get("display_name")
                 for key, item in data.items()
@@ -2058,7 +2310,7 @@ class TestGatewayRoutingTable:
                 assert release_a.wait(timeout=10)
             if "key-B" in names:
                 b_at_persistence.set()
-            return original_persist(data, generation)
+            return original_persist(data, generation, **kwargs)
 
         store._persist_routing_data = ordered_persist  # type: ignore[method-assign]
         with ThreadPoolExecutor(max_workers=2) as pool:

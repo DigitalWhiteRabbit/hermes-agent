@@ -180,6 +180,8 @@ class TestSaveOutsideLock:
             store = SessionStore(sessions_dir=tmp_path, config=config)
         store._loaded = True
         store._lock = _TrackedLock()
+        store._inflight_lock = _TrackedLock()
+        store._origin_refresh_registry_lock = _TrackedLock()
         source = _source()
         source.profile = "coder"
         source.transport_owner_profile = "default"
@@ -189,13 +191,21 @@ class TestSaveOutsideLock:
         original_persist = store._persist_routing_data
         original_record = store._record_gateway_session_peer
 
-        def tracking_persist(data, generation):
-            if store._lock.held:
+        def tracking_persist(data, generation, **kwargs):
+            if (
+                store._lock.held
+                or store._inflight_lock.held
+                or store._origin_refresh_registry_lock.held
+            ):
                 calls_under_lock.append("routing")
-            return original_persist(data, generation)
+            return original_persist(data, generation, **kwargs)
 
         def tracking_record(*args, **kwargs):
-            if store._lock.held:
+            if (
+                store._lock.held
+                or store._inflight_lock.held
+                or store._origin_refresh_registry_lock.held
+            ):
                 calls_under_lock.append("peer")
             return original_record(*args, **kwargs)
 
@@ -293,4 +303,3 @@ def test_auto_reset_does_not_recover_session_being_ended(tmp_path):
         old.session_id, "suspended"
     )
     db.end_session.assert_not_called()
-
