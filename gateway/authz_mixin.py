@@ -151,6 +151,12 @@ class GatewayAuthorizationMixin:
                 transport_platform = Platform(transport_platform)
             except ValueError:
                 transport_platform = None
+        elif not isinstance(transport_platform, Platform):
+            # Bare fixtures and third-party sources may expose dynamic proxy
+            # attributes (for example MagicMock) for fields they do not
+            # actually carry.  Only durable, typed provenance may override
+            # the source platform; everything else follows the legacy lookup.
+            transport_platform = None
         if transport_platform is not None:
             owner_profile = (
                 transport_owner.strip()
