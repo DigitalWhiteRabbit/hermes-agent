@@ -84,6 +84,24 @@ def _coerce_allow_set(raw) -> set[str]:
     return {part.strip() for part in str(raw).split(",") if part.strip()}
 
 
+def _normalize_transport_platform(value: object) -> Optional[Platform]:
+    """Return trusted persisted transport provenance, or ``None``.
+
+    Exact runtime types are intentional. ``isinstance`` is unsafe here because
+    mocks and arbitrary proxies can spoof ``__class__`` and impersonate a
+    ``Platform`` member. Plain persisted strings are normalized to the enum so
+    subsequent adapter and authorization lookups use a trusted key.
+    """
+    if type(value) is Platform:
+        return value
+    if type(value) is not str:
+        return None
+    try:
+        return Platform(value)
+    except ValueError:
+        return None
+
+
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
@@ -145,18 +163,9 @@ class GatewayAuthorizationMixin:
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
         transport_owner = getattr(source, "transport_owner_profile", None)
-        transport_platform = getattr(source, "transport_platform", None)
-        if isinstance(transport_platform, str):
-            try:
-                transport_platform = Platform(transport_platform)
-            except ValueError:
-                transport_platform = None
-        elif not isinstance(transport_platform, Platform):
-            # Bare fixtures and third-party sources may expose dynamic proxy
-            # attributes (for example MagicMock) for fields they do not
-            # actually carry.  Only durable, typed provenance may override
-            # the source platform; everything else follows the legacy lookup.
-            transport_platform = None
+        transport_platform = _normalize_transport_platform(
+            getattr(source, "transport_platform", None)
+        )
         if transport_platform is not None:
             owner_profile = (
                 transport_owner.strip()
@@ -440,7 +449,10 @@ class GatewayAuthorizationMixin:
 
         adapter_profile = self._adapter_profile_for_source(source)
         authorization_platform = (
-            getattr(source, "transport_platform", None) or source.platform
+            _normalize_transport_platform(
+                getattr(source, "transport_platform", None)
+            )
+            or source.platform
         )
 
         # Relay (and any adapter whose authorization is enforced by a trusted

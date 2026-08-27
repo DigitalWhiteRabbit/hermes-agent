@@ -9,6 +9,24 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
 
 
+class _PlatformClassSpoof:
+    """Object that fools ``isinstance(value, Platform)`` without being an enum."""
+
+    @property
+    def __class__(self):
+        return Platform
+
+
+class _RelayEqualPlatformSpoof(_PlatformClassSpoof):
+    """Spoof that can also collide with the Relay enum key in a dict lookup."""
+
+    def __hash__(self):
+        return hash(Platform.RELAY)
+
+    def __eq__(self, other):
+        return other is Platform.RELAY
+
+
 def _clear_auth_env(monkeypatch) -> None:
     for key in (
         "WECOM_ALLOWED_USERS",
@@ -17,6 +35,119 @@ def _clear_auth_env(monkeypatch) -> None:
         "WECOM_ALLOW_ALL_USERS",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+def _make_transport_lookup_runner():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    native = SimpleNamespace(
+        authorization_is_upstream=False,
+        enforces_own_access_policy=False,
+    )
+    discord = object()
+    relay = SimpleNamespace(
+        authorization_is_upstream=True,
+        enforces_own_access_policy=False,
+    )
+    runner.adapters = {
+        Platform.TELEGRAM: native,
+        Platform.DISCORD: discord,
+        Platform.RELAY: relay,
+    }
+    runner._profile_adapters = {}
+    runner.config = GatewayConfig()
+    runner.pairing_store = MagicMock()
+    runner.pairing_store.is_approved.return_value = False
+    runner.pairing_store._is_rate_limited.return_value = False
+    return runner, native, discord, relay
+
+
+def _transport_source(transport_platform):
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="user-1",
+        chat_id="chat-1",
+        chat_type="dm",
+        profile=None,
+        transport_owner_profile="default",
+    )
+    source.transport_platform = transport_platform
+    return source
+
+
+@pytest.mark.parametrize(
+    ("transport_platform", "expected_name"),
+    [
+        pytest.param(Platform.DISCORD, "discord", id="exact-discord-enum"),
+        pytest.param(Platform.RELAY, "relay", id="exact-relay-enum"),
+        pytest.param("discord", "discord", id="valid-discord-string"),
+        pytest.param("relay", "relay", id="valid-relay-string"),
+    ],
+)
+def test_adapter_lookup_accepts_only_real_persisted_transport_kinds(
+    transport_platform,
+    expected_name,
+):
+    runner, _native, discord, relay = _make_transport_lookup_runner()
+
+    expected = {"discord": discord, "relay": relay}[expected_name]
+    assert runner._adapter_for_source(_transport_source(transport_platform)) is expected
+
+
+@pytest.mark.parametrize(
+    "transport_platform",
+    [
+        pytest.param(None, id="none"),
+        pytest.param("future-transport", id="invalid-string"),
+        pytest.param(object(), id="arbitrary-object"),
+        pytest.param(MagicMock(), id="bare-magic-mock"),
+        pytest.param(MagicMock(spec=Platform), id="platform-spec-magic-mock"),
+        pytest.param(_PlatformClassSpoof(), id="class-spoofing-proxy"),
+        pytest.param(_RelayEqualPlatformSpoof(), id="relay-equal-class-spoof"),
+    ],
+)
+def test_invalid_persisted_transport_kinds_fall_back_to_native_adapter(
+    transport_platform,
+):
+    runner, native, _discord, _relay = _make_transport_lookup_runner()
+
+    assert runner._adapter_for_source(_transport_source(transport_platform)) is native
+
+
+def test_bare_magic_mock_source_uses_native_platform_fallback():
+    runner, native, _discord, _relay = _make_transport_lookup_runner()
+    source = MagicMock()
+    source.platform = Platform.TELEGRAM
+    source.profile = None
+    source.transport_owner_profile = None
+    source.delivered_via_upstream_relay = False
+    source._transport_adapter_ref = None
+
+    assert runner._adapter_for_source(source) is native
+
+
+def test_spoofed_transport_platform_cannot_gain_relay_authorization(monkeypatch):
+    for key in (
+        "TELEGRAM_ALLOWED_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "TELEGRAM_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    runner, _native, _discord, _relay = _make_transport_lookup_runner()
+
+    assert runner._is_user_authorized(
+        _transport_source(_RelayEqualPlatformSpoof())
+    ) is False
+
+
+def test_relay_delivery_marker_preserves_relay_adapter_with_invalid_provenance():
+    runner, _native, _discord, relay = _make_transport_lookup_runner()
+    source = _transport_source(_PlatformClassSpoof())
+    source.delivered_via_upstream_relay = True
+
+    assert runner._adapter_for_source(source) is relay
 
 
 def _make_multiplex_runner(monkeypatch):
