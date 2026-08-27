@@ -648,6 +648,63 @@ def test_secondary_transport_uses_only_its_pairing_approval_and_policy(
 
 
 @pytest.mark.asyncio
+async def test_secondary_explicit_ignore_sends_no_primary_pairing_response(
+    tmp_path,
+    monkeypatch,
+):
+    runner, _store = _runner_with_store(tmp_path)
+    primary_adapter = _StubAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"unauthorized_dm_behavior": "pair"},
+        ),
+        Platform.TELEGRAM,
+    )
+    primary_adapter.gateway_runner = runner
+    research_adapter = _StubAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"unauthorized_dm_behavior": "ignore"},
+        ),
+        Platform.TELEGRAM,
+    )
+    research_adapter.gateway_runner = runner
+    research_adapter.set_owner_profile("research")
+    research_adapter.send = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: primary_adapter}
+    runner._profile_adapters = {
+        "research": {Platform.TELEGRAM: research_adapter},
+    }
+    event = MessageEvent(
+        text="hello",
+        source=research_adapter.build_source(
+            chat_id="chat-1",
+            chat_type="dm",
+            user_id="user-1",
+        ),
+    )
+    pairing_store = _PairingStoreProbe(
+        False,
+        profile="research",
+        code="RESEARCH-CODE",
+    )
+    runner.pairing_stores = {"research": pairing_store}
+    runner._is_user_authorized_for_source = lambda _source: False
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda *_args, **_kwargs: [],
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    research_adapter.send.assert_not_awaited()
+    assert pairing_store.rate_limit_calls == []
+    assert pairing_store.code_calls == []
+
+
+@pytest.mark.asyncio
 async def test_primary_canonical_pairing_uses_transport_policy_store_and_home(
     tmp_path,
     monkeypatch,

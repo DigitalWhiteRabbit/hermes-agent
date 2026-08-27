@@ -881,7 +881,8 @@ class GatewayAuthorizationMixin:
         """Return how unauthorized DMs should be handled for a platform.
 
         Resolution order:
-        1. Explicit per-platform ``unauthorized_dm_behavior`` in config — always wins.
+        1. Explicit per-platform ``unauthorized_dm_behavior`` from the
+           transport-owning adapter — always wins.
         2. Email defaults to ``"ignore"`` unless explicitly opted into
            pairing. Inboxes may contain arbitrary unread human messages, so
            replying with pairing codes is not a safe platform default.
@@ -898,7 +899,29 @@ class GatewayAuthorizationMixin:
         """
         config = getattr(self, "config", None)
 
-        # Check for an explicit per-platform override first.
+        # In multiplex mode each live adapter owns its intake policy.  Resolve
+        # the explicit override from that adapter before consulting the
+        # runner's primary/global configuration, just as ``dm_policy`` does
+        # below.  Directly constructed PlatformConfig instances may contain
+        # unnormalized values, so accept only the two supported behaviors.
+        if platform:
+            adapter = self._authorization_adapter(platform, profile)
+            adapter_config = getattr(adapter, "config", None)
+            adapter_extra = getattr(adapter_config, "extra", None)
+            if (
+                isinstance(adapter_extra, dict)
+                and "unauthorized_dm_behavior" in adapter_extra
+            ):
+                adapter_behavior = (
+                    str(adapter_extra.get("unauthorized_dm_behavior") or "")
+                    .strip()
+                    .lower()
+                )
+                if adapter_behavior in {"pair", "ignore"}:
+                    return adapter_behavior
+
+        # Fall back to the runner's explicit per-platform override for bare
+        # runners and the primary/default adapter.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
             platform_cfg = config.platforms.get(platform) if hasattr(config, "platforms") else None
             if platform_cfg and "unauthorized_dm_behavior" in getattr(platform_cfg, "extra", {}):
