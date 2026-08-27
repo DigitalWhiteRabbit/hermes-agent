@@ -704,6 +704,41 @@ async def test_secondary_explicit_ignore_sends_no_primary_pairing_response(
     assert pairing_store.code_calls == []
 
 
+@pytest.mark.parametrize("enabled", [False, 1])
+def test_secondary_explicit_policy_preserves_primary_precedence_feature_off(
+    tmp_path,
+    enabled,
+):
+    runner, _store = _runner_with_store(tmp_path)
+    runner.config = _gateway_config(enabled=False)
+    runner.config.profile_switching = SimpleNamespace(enabled=enabled)
+    runner.config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True,
+        extra={"unauthorized_dm_behavior": "pair"},
+    )
+    primary_adapter = _StubAdapter(
+        runner.config.platforms[Platform.TELEGRAM],
+        Platform.TELEGRAM,
+    )
+    research_adapter = _StubAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"unauthorized_dm_behavior": "ignore"},
+        ),
+        Platform.TELEGRAM,
+    )
+    research_adapter.set_owner_profile("research")
+    runner.adapters = {Platform.TELEGRAM: primary_adapter}
+    runner._profile_adapters = {
+        "research": {Platform.TELEGRAM: research_adapter},
+    }
+
+    assert runner._get_unauthorized_dm_behavior(
+        Platform.TELEGRAM,
+        profile="research",
+    ) == "pair"
+
+
 @pytest.mark.asyncio
 async def test_primary_canonical_pairing_uses_transport_policy_store_and_home(
     tmp_path,

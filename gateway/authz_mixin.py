@@ -881,8 +881,9 @@ class GatewayAuthorizationMixin:
         """Return how unauthorized DMs should be handled for a platform.
 
         Resolution order:
-        1. Explicit per-platform ``unauthorized_dm_behavior`` from the
-           transport-owning adapter — always wins.
+        1. With profile switching enabled, explicit per-platform
+           ``unauthorized_dm_behavior`` from the transport-owning adapter
+           wins.
         2. Email defaults to ``"ignore"`` unless explicitly opted into
            pairing. Inboxes may contain arbitrary unread human messages, so
            replying with pairing codes is not a safe platform default.
@@ -904,7 +905,7 @@ class GatewayAuthorizationMixin:
         # runner's primary/global configuration, just as ``dm_policy`` does
         # below.  Directly constructed PlatformConfig instances may contain
         # unnormalized values, so accept only the two supported behaviors.
-        if platform:
+        if platform and self._profile_switching_provenance_enabled():
             adapter = self._authorization_adapter(platform, profile)
             adapter_config = getattr(adapter, "config", None)
             adapter_extra = getattr(adapter_config, "extra", None)
