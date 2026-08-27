@@ -1,0 +1,376 @@
+from __future__ import annotations
+
+import inspect
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+
+import pytest
+
+from gateway.profile_switching.migrations import LATEST_SCHEMA_VERSION
+from gateway.profile_switching.models import ReasonCode, ScopeKey, ScopeKind
+from gateway.profile_switching.store import ProfileRoutingStore
+
+
+def _scope(thread_id: str | None = None) -> ScopeKey:
+    return ScopeKey("telegram", "telegram:primary", "chat-1", thread_id)
+
+
+def test_migration_creates_schema_and_enables_foreign_keys(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    store = ProfileRoutingStore(path)
+    ProfileRoutingStore(path)
+
+    with sqlite3.connect(path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        version = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+
+    assert {
+        "schema_meta",
+        "profile_bindings",
+        "profile_once",
+        "profile_session_bindings",
+        "profile_switch_audit",
+        "profile_picker_nonces",
+    } <= tables
+    assert version == str(LATEST_SCHEMA_VERSION)
+    with closing(store._connect()) as conn:
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+
+
+@pytest.mark.requires_wal
+def test_connections_use_wal_when_runtime_supports_it(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+
+    with closing(store._connect()) as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+
+    assert mode.lower() == "wal"
+
+
+def test_set_binding_upserts_and_increments_version(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db", clock=lambda: 10.0)
+    first = store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+
+    store._clock = lambda: 20.0
+    second = store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="research",
+        created_by_user_id="user-2",
+    )
+
+    assert first.version == 1
+    assert second.profile_name == "research"
+    assert second.created_by_user_id == "user-2"
+    assert second.created_at == 10.0
+    assert second.updated_at == 20.0
+    assert second.version == 2
+    assert second.scope.thread_id is None
+
+    with sqlite3.connect(store.path) as conn:
+        assert (
+            conn.execute("SELECT thread_id FROM profile_bindings").fetchone()[0] == ""
+        )
+
+
+def test_thread_and_chat_bindings_are_distinct(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    threaded = _scope("thread-7")
+    store.set_binding(
+        threaded,
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    store.set_binding(
+        threaded,
+        ScopeKind.THREAD,
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+
+    chat = store.get_binding(threaded, ScopeKind.CHAT)
+    thread = store.get_binding(threaded, ScopeKind.THREAD)
+
+    assert chat is not None and chat.profile_name == "coder"
+    assert chat.scope.thread_id is None
+    assert thread is not None and thread.profile_name == "research"
+    assert thread.scope.thread_id == "thread-7"
+
+
+def test_expired_binding_is_not_returned(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db", clock=lambda: 20.0)
+    store.set_binding(
+        _scope(),
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+        expires_at=20.0,
+    )
+
+    assert store.get_binding(_scope(), ScopeKind.CHAT) is None
+
+
+def test_clear_binding_only_removes_requested_scope(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    threaded = _scope("thread-7")
+    store.set_binding(
+        threaded,
+        ScopeKind.CHAT,
+        profile_name="coder",
+        created_by_user_id="user-1",
+    )
+    store.set_binding(
+        threaded,
+        ScopeKind.THREAD,
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+
+    assert store.clear_binding(threaded, ScopeKind.THREAD) is True
+    assert store.clear_binding(threaded, ScopeKind.THREAD) is False
+    assert store.get_binding(threaded, ScopeKind.CHAT) is not None
+
+
+def test_claim_once_returns_value_exactly_once(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    store.set_once(
+        _scope(),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+
+    claimed = store.claim_once(_scope())
+
+    assert claimed is not None
+    assert claimed.profile_name == "research"
+    assert claimed.scope.thread_id is None
+    assert store.claim_once(_scope()) is None
+
+
+def test_empty_thread_id_is_returned_as_absent_from_once_binding(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    store.set_once(
+        _scope(""),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+
+    claimed = store.claim_once(_scope(""))
+
+    assert claimed is not None
+    assert claimed.scope.thread_id is None
+    assert claimed.scope_kind is ScopeKind.CHAT
+
+
+def test_expired_once_is_deleted_when_claimed(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    store = ProfileRoutingStore(path, clock=lambda: 20.0)
+    store.set_once(
+        _scope(),
+        profile_name="research",
+        created_by_user_id="user-1",
+        expires_at=20.0,
+    )
+
+    assert store.claim_once(_scope()) is None
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM profile_once").fetchone()[0] == 0
+
+
+def test_two_connections_cannot_claim_same_once(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    first = ProfileRoutingStore(path)
+    second = ProfileRoutingStore(path)
+    first.set_once(
+        _scope("thread-7"),
+        profile_name="research",
+        created_by_user_id="user-1",
+    )
+    barrier = threading.Barrier(2)
+
+    def claim(store: ProfileRoutingStore):
+        barrier.wait()
+        return store.claim_once(_scope("thread-7"))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(claim, (first, second)))
+
+    assert sum(result is not None for result in results) == 1
+    assert [result.profile_name for result in results if result is not None] == [
+        "research"
+    ]
+
+
+def test_record_session_is_scoped_by_profile(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db", clock=lambda: 10.0)
+    scope = _scope("thread-7")
+    store.record_session(scope, "coder", "coder-session")
+    store.record_session(scope, "research", "research-session")
+
+    assert store.get_session(scope, "coder") == "coder-session"
+    assert store.get_session(scope, "research") == "research-session"
+    assert store.get_session(_scope(), "coder") is None
+
+
+def test_audit_never_accepts_message_text_field(tmp_path):
+    store = ProfileRoutingStore(tmp_path / "profile-routing.db")
+    parameters = inspect.signature(store.append_audit).parameters
+
+    assert "message_text" not in parameters
+    assert all(
+        parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        for name, parameter in parameters.items()
+        if name != "self"
+    )
+    with pytest.raises(TypeError, match="message_text"):
+        store.append_audit(
+            actor_user_id="user-1",
+            scope=_scope(),
+            old_profile=None,
+            new_profile="coder",
+            scope_kind=ScopeKind.CHAT,
+            source="command",
+            result="allowed",
+            reason_code=ReasonCode.ALLOWED,
+            message_text="do not persist me",
+        )
+
+
+def test_append_audit_persists_only_the_scalar_contract(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    store = ProfileRoutingStore(path, clock=lambda: 42.0)
+    store.append_audit(
+        actor_user_id="user-1",
+        scope=_scope(),
+        old_profile=None,
+        new_profile="coder",
+        scope_kind=ScopeKind.CHAT,
+        source="command",
+        result="allowed",
+        reason_code=ReasonCode.ALLOWED,
+    )
+
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM profile_switch_audit").fetchone()
+
+    assert dict(row) == {
+        "id": 1,
+        "created_at": 42.0,
+        "actor_user_id": "user-1",
+        "platform": "telegram",
+        "account_id": "telegram:primary",
+        "chat_id": "chat-1",
+        "thread_id": None,
+        "old_profile": None,
+        "new_profile": "coder",
+        "scope_kind": "chat",
+        "source": "command",
+        "result": "allowed",
+        "reason_code": "allowed",
+    }
+
+
+def test_prune_removes_old_audit_and_expired_nonces(tmp_path):
+    path = tmp_path / "profile-routing.db"
+    store = ProfileRoutingStore(path, clock=lambda: 100.0)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            INSERT INTO profile_switch_audit (
+                created_at, actor_user_id, platform, account_id, chat_id,
+                source, result, reason_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                10.0,
+                "user-1",
+                "telegram",
+                "telegram:primary",
+                "chat-1",
+                "command",
+                "allowed",
+                "allowed",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO profile_switch_audit (
+                created_at, actor_user_id, platform, account_id, chat_id,
+                source, result, reason_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                90.0,
+                "user-1",
+                "telegram",
+                "telegram:primary",
+                "chat-1",
+                "command",
+                "allowed",
+                "allowed",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO profile_picker_nonces (
+                nonce_hash, platform, account_id, actor_user_id, chat_id,
+                message_id, action, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "expired",
+                "telegram",
+                "telegram:primary",
+                "user-1",
+                "chat-1",
+                "message-1",
+                "set",
+                99.0,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO profile_picker_nonces (
+                nonce_hash, platform, account_id, actor_user_id, chat_id,
+                message_id, action, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "live",
+                "telegram",
+                "telegram:primary",
+                "user-1",
+                "chat-1",
+                "message-2",
+                "set",
+                101.0,
+            ),
+        )
+
+    audit_removed, nonces_removed = store.prune(audit_before=50.0)
+
+    assert (audit_removed, nonces_removed) == (1, 1)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT created_at FROM profile_switch_audit"
+        ).fetchall() == [(90.0,)]
+        assert conn.execute(
+            "SELECT nonce_hash FROM profile_picker_nonces"
+        ).fetchall() == [("live",)]
