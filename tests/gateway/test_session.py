@@ -2050,6 +2050,145 @@ class TestGatewayRoutingTable:
         assert json.loads(row["origin_json"])["transport_platform"] == "relay"
         assert row["display_name"] == "relay-B"
 
+    @pytest.mark.parametrize("lifecycle", ["switch", "reset"])
+    def test_feature_on_lifecycle_peer_write_cannot_regress_newer_origin_commit(
+        self, tmp_path, lifecycle
+    ):
+        """A delayed lifecycle peer write cannot overwrite a newer live origin."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        source_a = self._source()
+        source_a.profile = "coder"
+        source_a.chat_name = "native-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        original_entry = store.get_or_create_session(source_a)
+
+        target_session_id = "resume-target"
+        if lifecycle == "switch":
+            store._db.create_session(
+                target_session_id,
+                source="telegram",
+                user_id=source_a.user_id,
+            )
+
+        source_b = self._source()
+        source_b.profile = "coder"
+        source_b.chat_name = "relay-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        lifecycle_at_peer = threading.Event()
+        release_lifecycle = threading.Event()
+        lifecycle_has_serializer = threading.Event()
+        refresh_attempted_serializer = threading.Event()
+        actor = threading.local()
+        original_acquire = store._acquire_origin_refresh_lock
+        original_record = store._record_gateway_session_peer
+
+        def observed_acquire(session_key):
+            label = getattr(actor, "label", None)
+            if label == "refresh":
+                refresh_attempted_serializer.set()
+            keyed = original_acquire(session_key)
+            if label == "lifecycle":
+                lifecycle_has_serializer.set()
+            return keyed
+
+        def blocked_record(session_id, session_key, incoming, *args, **kwargs):
+            if getattr(actor, "label", None) == "lifecycle":
+                lifecycle_at_peer.set()
+                assert release_lifecycle.wait(timeout=10)
+            return original_record(
+                session_id, session_key, incoming, *args, **kwargs
+            )
+
+        store._acquire_origin_refresh_lock = observed_acquire  # type: ignore[method-assign]
+        store._record_gateway_session_peer = blocked_record  # type: ignore[method-assign]
+
+        def run_lifecycle():
+            actor.label = "lifecycle"
+            if lifecycle == "switch":
+                return store.switch_session(
+                    original_entry.session_key,
+                    target_session_id,
+                )
+            return store.reset_session(original_entry.session_key)
+
+        def refresh():
+            actor.label = "refresh"
+            with store._lock:
+                current = store._entries[original_entry.session_key]
+            store._refresh_dynamic_origin_for_turn(current, source_b)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            lifecycle_future = pool.submit(run_lifecycle)
+            assert lifecycle_at_peer.wait(timeout=10)
+            with store._lock:
+                published = store._entries[original_entry.session_key]
+                published_session_id = published.session_id
+            assert published_session_id != original_entry.session_id
+
+            refresh_future = pool.submit(refresh)
+            assert refresh_attempted_serializer.wait(timeout=10)
+            if lifecycle_has_serializer.is_set():
+                release_lifecycle.set()
+            else:
+                refresh_future.result(timeout=10)
+                release_lifecycle.set()
+            lifecycle_future.result(timeout=10)
+            refresh_future.result(timeout=10)
+
+        live = store._entries[original_entry.session_key]
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing = SessionEntry.from_dict(
+            json.loads(routing_rows[original_entry.session_key])
+        )
+        row = store._db.get_session(live.session_id)
+        assert row is not None
+        assert live.session_id == published_session_id
+        assert live.origin is source_b
+        assert routing.session_id == published_session_id
+        assert routing.origin is not None
+        assert routing.origin.transport_platform == Platform.RELAY
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+        assert row["display_name"] == "relay-B"
+
+    def test_feature_on_update_session_keeps_single_entry_fast_path(self, tmp_path):
+        """Metadata-only writes must not rewrite the complete routing index."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = self._source()
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+        entry = store.get_or_create_session(source)
+
+        save_one = MagicMock(wraps=store._db.save_gateway_routing_entry)
+        replace_all = MagicMock(wraps=store._db.replace_gateway_routing_entries)
+        save_json = MagicMock(wraps=store._save_sessions_json)
+        store._db.save_gateway_routing_entry = save_one
+        store._db.replace_gateway_routing_entries = replace_all
+        store._save_sessions_json = save_json
+
+        store.update_session(entry.session_key, last_prompt_tokens=23)
+
+        assert save_one.call_count == 1
+        assert replace_all.call_count == 0
+        assert save_json.call_count == 0
+        row = store._db.get_session(entry.session_id)
+        assert row is not None
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+
     @pytest.mark.parametrize("failure_point", ["routing", "json", "peer"])
     def test_origin_commit_failure_is_signaled_and_retry_heals_all_views(
         self, tmp_path, failure_point
@@ -2223,19 +2362,13 @@ class TestGatewayRoutingTable:
 
         old_source = source("old-waiter", Platform.TELEGRAM)
         adjacent_source = source("adjacent-flight", Platform.RELAY)
-        old_attempted = threading.Event()
-        adjacent_attempted = threading.Event()
+        old_queued = threading.Event()
+        adjacent_queued = threading.Event()
         actor = threading.local()
+        assigned_tickets = {}
         commit_order = []
         original_acquire = store._acquire_origin_refresh_lock
         original_record = store._record_gateway_session_peer
-
-        def observed_acquire(session_key):
-            if actor.label == "old-waiter":
-                old_attempted.set()
-            elif actor.label == "adjacent-flight":
-                adjacent_attempted.set()
-            return original_acquire(session_key)
 
         def observed_record(session_id, session_key, incoming, *args, **kwargs):
             result = original_record(
@@ -2248,9 +2381,24 @@ class TestGatewayRoutingTable:
                 commit_order.append(incoming.chat_name)
             return result
 
-        store._acquire_origin_refresh_lock = observed_acquire  # type: ignore[method-assign]
         store._record_gateway_session_peer = observed_record  # type: ignore[method-assign]
         owner_lock = original_acquire(entry.session_key)
+        keyed = store._origin_refresh_registry[entry.session_key]
+
+        class TicketObservedCondition(threading.Condition):
+            def wait(self, timeout=None):
+                label = actor.label
+                assigned_tickets[label] = keyed.next_ticket - 1
+                if label == "old-waiter":
+                    old_queued.set()
+                elif label == "adjacent-flight":
+                    adjacent_queued.set()
+                return super().wait(timeout)
+
+        # The owner is outside its condition critical section now.  Replace
+        # only the test's wait observer so each Event fires after the real
+        # acquire path has allocated a ticket and reached its queued wait.
+        keyed.condition = TicketObservedCondition()
 
         def refresh(label, incoming):
             actor.label = label
@@ -2259,11 +2407,15 @@ class TestGatewayRoutingTable:
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 old_future = pool.submit(refresh, "old-waiter", old_source)
-                assert old_attempted.wait(timeout=10)
+                assert old_queued.wait(timeout=10)
+                with keyed.condition:
+                    assert keyed.next_ticket == 2
                 adjacent_future = pool.submit(
                     refresh, "adjacent-flight", adjacent_source
                 )
-                assert adjacent_attempted.wait(timeout=10)
+                assert adjacent_queued.wait(timeout=10)
+                with keyed.condition:
+                    assert keyed.next_ticket == 3
                 store._release_origin_refresh_lock(entry.session_key, owner_lock)
                 owner_lock = None
                 old_future.result(timeout=10)
@@ -2273,6 +2425,7 @@ class TestGatewayRoutingTable:
                 store._release_origin_refresh_lock(entry.session_key, owner_lock)
 
         assert commit_order == ["old-waiter", "adjacent-flight"]
+        assert assigned_tickets == {"old-waiter": 1, "adjacent-flight": 2}
         assert store._origin_refresh_registry == {}
 
     def test_blocked_origin_commit_for_one_key_does_not_block_another_key(

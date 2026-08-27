@@ -1534,6 +1534,32 @@ class SessionStore:
                 f"origin provenance persistence failed for {session_key}"
             ) from exc
 
+    def _record_current_gateway_session_peer(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        *,
+        include_compression_ancestors: bool = False,
+    ) -> None:
+        """Record a lifecycle peer from the current entry under origin ordering."""
+        refresh_lock = self._acquire_origin_refresh_lock(session_key)
+        try:
+            with self._lock:
+                current = self._entries.get(session_key)
+                if current is None or current.session_id != expected_session_id:
+                    return
+                source = current.origin
+                display_name = current.display_name
+            self._record_gateway_session_peer(
+                expected_session_id,
+                session_key,
+                source,
+                display_name=display_name,
+                include_compression_ancestors=include_compression_ancestors,
+            )
+        finally:
+            self._release_origin_refresh_lock(session_key, refresh_lock)
+
     def _open_session_db_for_active_scope(self):
         """Return the SessionDB for the profile scope active on this task.
 
@@ -3280,20 +3306,19 @@ class SessionStore:
                         entry.updated_at = _now()
                     if last_prompt_tokens is not None:
                         entry.last_prompt_tokens = last_prompt_tokens
-                    routing_data, routing_generation = (
-                        self._snapshot_routing_locked()
-                    )
                     peer_session_id = entry.session_id
-                    peer_origin = entry.origin
-                    peer_display_name = entry.display_name
 
-                # Feature-on metadata writes participate in the same ordered,
-                # strict provenance commit as inbound origin refreshes. This
-                # prevents a stale post-turn snapshot from overwriting a newer
-                # transport origin in the unversioned session peer row.
-                self._persist_origin_commit(
-                    routing_data,
-                    routing_generation,
+                # Metadata does not change transport provenance or the route.
+                # Keep the per-entry UPSERT fast path while the keyed boundary
+                # prevents a later stale peer write from crossing a refresh.
+                self._save_entry(session_key)
+                with self._lock:
+                    current = self._entries.get(session_key)
+                    if current is None or current.session_id != peer_session_id:
+                        return
+                    peer_origin = current.origin
+                    peer_display_name = current.display_name
+                self._record_gateway_session_peer(
                     peer_session_id,
                     session_key,
                     peer_origin,
@@ -3765,12 +3790,18 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
-                self._record_gateway_session_peer(
-                    session_id,
-                    session_key,
-                    old_entry.origin,
-                    display_name=new_entry.display_name if new_entry else None,
-                )
+                if self._transport_provenance_enabled():
+                    self._record_current_gateway_session_peer(
+                        session_key,
+                        session_id,
+                    )
+                else:
+                    self._record_gateway_session_peer(
+                        session_id,
+                        session_key,
+                        old_entry.origin,
+                        display_name=new_entry.display_name if new_entry else None,
+                    )
             except Exception as e:
                 logger.warning(
                     "Failed to create session row %s for %s during reset: %s "
@@ -3880,13 +3911,20 @@ class SessionStore:
                 self._db.reopen_session(target_session_id)
             except Exception as e:
                 logger.debug("Session DB reopen_session failed: %s", e)
-            self._record_gateway_session_peer(
-                target_session_id,
-                session_key,
-                new_entry.origin if new_entry else None,
-                display_name=new_entry.display_name if new_entry else None,
-                include_compression_ancestors=True,
-            )
+            if self._transport_provenance_enabled():
+                self._record_current_gateway_session_peer(
+                    session_key,
+                    target_session_id,
+                    include_compression_ancestors=True,
+                )
+            else:
+                self._record_gateway_session_peer(
+                    target_session_id,
+                    session_key,
+                    new_entry.origin if new_entry else None,
+                    display_name=new_entry.display_name if new_entry else None,
+                    include_compression_ancestors=True,
+                )
 
         return new_entry
 
