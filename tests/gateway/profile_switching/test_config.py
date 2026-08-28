@@ -2,12 +2,27 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from gateway.config import GatewayConfig, ProfileSwitchingConfig
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from gateway.config import (
+    GatewayConfig,
+    ProfileSwitchRule,
+    ProfileSwitchingConfig,
+)
+from gateway.profile_switching.models import ReasonCode, ScopeKey
+from gateway.profile_switching.policy import ProfilePolicy
 
 
 _EXPLICIT_ALLOWLIST_ERROR = (
     "profile_switching.enabled requires an explicit "
     "gateway.multiplex_profile_allowlist; use [] for default-only"
+)
+_DEFAULT_PRIMARY_ERROR = (
+    "profile_switching.enabled requires the default profile gateway; "
+    "launch with hermes -p default gateway run"
+)
+_SENSITIVE_PROFILE_ERROR = (
+    "profile 'production' cannot be served, visible, or switched "
+    "in Milestone 1; it may only be named in profile_switching.hidden"
 )
 
 
@@ -93,6 +108,330 @@ def test_direct_constructor_rejects_enabled_switching_without_allowlist():
     assert str(exc_info.value) == _EXPLICIT_ALLOWLIST_ERROR
 
 
+def test_named_profile_config_fails_before_gateway_state_is_initialized(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    (profile_home / "config.yaml").write_text(
+        "gateway:\n"
+        "  multiplex_profiles: true\n"
+        "  multiplex_profile_allowlist: []\n"
+        "  profile_switching:\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
+
+    from gateway.run import load_gateway_config_for_runner
+
+    with pytest.raises(ValueError) as exc_info:
+        load_gateway_config_for_runner()
+
+    assert str(exc_info.value) == _DEFAULT_PRIMARY_ERROR
+    assert not (profile_home / "state.db").exists()
+    assert not (profile_home / "state" / "profile-routing.db").exists()
+
+
+def test_direct_constructor_rejects_feature_on_from_named_profile(
+    tmp_path,
+    monkeypatch,
+):
+    profile_home = tmp_path / "hermes" / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+
+    assert str(exc_info.value) == _DEFAULT_PRIMARY_ERROR
+
+
+def test_named_profile_feature_off_and_default_profile_feature_on_remain_valid(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    named_feature_off = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=None,
+        profile_switching=ProfileSwitchingConfig(enabled=False),
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    default_feature_on = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[],
+        profile_switching=ProfileSwitchingConfig(enabled=True),
+    )
+
+    assert named_feature_off.profile_switching.enabled is False
+    assert default_feature_on.profile_switching.enabled is True
+
+
+def test_secondary_context_scope_does_not_override_default_process_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    home_token = set_hermes_home_override(profile_home)
+    try:
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+    finally:
+        reset_hermes_home_override(home_token)
+
+    assert config.profile_switching.enabled is True
+
+
+def test_runner_revalidates_process_profile_before_session_state(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "hermes"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=[],
+        profile_switching=ProfileSwitchingConfig(enabled=True),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    from gateway.run import GatewayRunner
+
+    with pytest.raises(ValueError) as exc_info:
+        GatewayRunner(config)
+
+    assert str(exc_info.value) == _DEFAULT_PRIMARY_ERROR
+    assert not (profile_home / "state.db").exists()
+    assert not (profile_home / "sessions").exists()
+
+
+def test_symlinked_named_process_home_cannot_alias_the_default_gateway(
+    tmp_path,
+    monkeypatch,
+):
+    profile_home = tmp_path / "hermes" / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    launch_home = tmp_path / "current-home"
+    launch_home.symlink_to(profile_home, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+
+    assert str(exc_info.value) == _DEFAULT_PRIMARY_ERROR
+
+
+def test_nested_symlinked_named_process_home_cannot_alias_default(
+    tmp_path,
+    monkeypatch,
+):
+    external_home = tmp_path / "external-coder"
+    external_home.mkdir()
+    profile_home = tmp_path / "hermes" / "profiles" / "coder"
+    profile_home.parent.mkdir(parents=True)
+    profile_home.symlink_to(external_home, target_is_directory=True)
+    launch_home = tmp_path / "current-home"
+    launch_home.symlink_to(profile_home, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=[],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+
+    assert str(exc_info.value) == _DEFAULT_PRIMARY_ERROR
+
+
+def test_direct_mixed_case_hidden_profile_remains_hidden_to_policy():
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=["coder"],
+        profile_switching=ProfileSwitchingConfig(
+            enabled=True,
+            hidden=("Coder",),
+            rules=(ProfileSwitchRule("coder", users=("user-1",), chats=("*",)),),
+        ),
+    )
+    policy = ProfilePolicy(
+        config.profile_switching,
+        served_profiles={"default", "coder"},
+        existing_profiles={"default", "coder"},
+    )
+
+    decision = policy.evaluate(
+        "coder",
+        ScopeKey("telegram", "telegram:primary", "chat-1", None),
+        "user-1",
+    )
+
+    assert decision.reason is ReasonCode.PROFILE_HIDDEN
+
+
+def test_direct_mixed_case_visible_rule_is_usable_by_canonical_profile():
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        multiplex_profile_allowlist=["coder"],
+        profile_switching=ProfileSwitchingConfig(
+            enabled=True,
+            default_visible=("Coder",),
+            rules=(ProfileSwitchRule("Coder", users=("user-1",), chats=("*",)),),
+        ),
+    )
+    policy = ProfilePolicy(
+        config.profile_switching,
+        served_profiles={"default", "coder"},
+        existing_profiles={"default", "coder"},
+    )
+
+    visible = policy.visible_profiles(
+        ScopeKey("telegram", "telegram:primary", "chat-1", None),
+        "user-1",
+    )
+
+    assert visible == ("coder",)
+
+
+@pytest.mark.parametrize("profile", ["production", "Production"])
+@pytest.mark.parametrize("location", ["allowlist", "visible", "rule"])
+def test_direct_constructor_rejects_sensitive_profile_like_parser(location, profile):
+    allowlist = ["coder"]
+    switching = ProfileSwitchingConfig(enabled=True)
+    if location == "allowlist":
+        allowlist = [profile]
+    elif location == "visible":
+        switching = ProfileSwitchingConfig(
+            enabled=True,
+            default_visible=(profile,),
+        )
+    else:
+        switching = ProfileSwitchingConfig(
+            enabled=True,
+            rules=(ProfileSwitchRule(profile, users=("user-1",)),),
+        )
+
+    with pytest.raises(ValueError) as exc_info:
+        GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=allowlist,
+            profile_switching=switching,
+        )
+
+    assert str(exc_info.value) == _SENSITIVE_PROFILE_ERROR
+
+
+@pytest.mark.parametrize(
+    "switching,error",
+    [
+        (
+            ProfileSwitchingConfig(default_visible="production"),
+            "default_visible must be a list",
+        ),
+        (
+            ProfileSwitchingConfig(hidden="production"),
+            "hidden must be a list",
+        ),
+        (
+            ProfileSwitchingConfig(
+                default_visible=("coder",),
+                hidden=("Coder",),
+            ),
+            "both visible and hidden",
+        ),
+        (
+            ProfileSwitchingConfig(default_visible=("research",)),
+            "default_visible profiles are not served",
+        ),
+        (
+            ProfileSwitchingConfig(
+                rules=(
+                    ProfileSwitchRule("coder"),
+                    ProfileSwitchRule("Coder"),
+                )
+            ),
+            "duplicate profile_switching rule",
+        ),
+        (
+            ProfileSwitchingConfig(
+                rules=(ProfileSwitchRule("coder", require_confirmation=True),)
+            ),
+            "require_confirmation=true.*unsupported",
+        ),
+        (
+            ProfileSwitchingConfig(
+                rules=(ProfileSwitchRule("coder", threads=("thread-1",)),)
+            ),
+            "threads requires concrete chat IDs",
+        ),
+        (
+            ProfileSwitchingConfig(rules=(ProfileSwitchRule("coder", users=("",)),)),
+            "contains an invalid ID",
+        ),
+    ],
+)
+def test_direct_constructor_enforces_shared_policy_invariants(switching, error):
+    with pytest.raises(ValueError, match=error):
+        GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=switching,
+        )
+
+
+def test_non_literal_enabled_integer_stays_off_across_roundtrip():
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        profile_switching=ProfileSwitchingConfig(enabled=1),
+    )
+
+    serialized = config.to_dict()
+    restored = GatewayConfig.from_dict(serialized)
+
+    assert config.profile_switching.enabled is not True
+    assert "profile_switching" not in serialized
+    assert restored.profile_switching.enabled is False
+
+
+def test_policy_error_precedes_positive_limit_error_like_legacy_parser():
+    with pytest.raises(ValueError, match="duplicate.*coder"):
+        GatewayConfig.from_dict({
+            "multiplex_profile_allowlist": ["coder"],
+            "profile_switching": {
+                "picker_ttl_seconds": 0,
+                "rules": [
+                    {"profile": "coder"},
+                    {"profile": "Coder"},
+                ],
+            },
+        })
+
+
 def test_enabled_switching_accepts_explicit_empty_allowlist_as_default_only():
     cfg = GatewayConfig.from_dict({
         "gateway": {
@@ -103,6 +442,9 @@ def test_enabled_switching_accepts_explicit_empty_allowlist_as_default_only():
     })
 
     assert cfg.multiplex_profile_allowlist == []
+    from gateway.run import _multiplex_profile_homes
+
+    assert [name for name, _home in _multiplex_profile_homes(cfg)] == ["default"]
 
 
 @pytest.mark.parametrize(

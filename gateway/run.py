@@ -7014,6 +7014,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # A config object can be constructed while the process points at the
+        # default profile and injected after a named-profile launch. Recheck the
+        # process-owner contract before SessionStore or any adapter/state setup.
+        self.config.validate_profile_switching_contract()
         self._profile_switching_service = None
         switching_enabled = (
             getattr(self.config.profile_switching, "enabled", False) is True

@@ -108,6 +108,12 @@ def _validate_profile_switching_gateway_contract(
         )
 
 
+_PROFILE_SWITCHING_DEFAULT_PRIMARY_ERROR = (
+    "profile_switching.enabled requires the default profile gateway; "
+    "launch with hermes -p default gateway run"
+)
+
+
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
 # override. Anything not in either set — and a blank/whitespace value — is
 # treated as "unset" so it falls through to config.yaml rather than silently
@@ -1071,7 +1077,6 @@ class ProfileSwitchingConfig:
         if not isinstance(rules_raw, (list, tuple)):
             raise ValueError("profile_switching.rules must be a list")
         rules = []
-        rule_profiles: set[str] = set()
         for index, rule_raw in enumerate(rules_raw):
             if not isinstance(rule_raw, dict):
                 raise ValueError(f"profile_switching.rules[{index}] must be a mapping")
@@ -1087,11 +1092,6 @@ class ProfileSwitchingConfig:
                 )
             profile = normalize_profile_name(rule_raw["profile"])
             validate_profile_name(profile)
-            if profile in rule_profiles:
-                raise ValueError(
-                    f"duplicate profile_switching rule for profile {profile!r}"
-                )
-            rule_profiles.add(profile)
             users = id_list(
                 rule_raw.get("users", ()),
                 f"profile_switching.rules[{index}].users",
@@ -1104,77 +1104,262 @@ class ProfileSwitchingConfig:
                 rule_raw.get("threads", ()),
                 f"profile_switching.rules[{index}].threads",
             )
-            if threads and (not chats or "*" in chats):
-                raise ValueError(
-                    f"profile_switching.rules[{index}].threads requires "
-                    "concrete chat IDs and cannot use wildcard chats"
-                )
             require_confirmation = _coerce_bool(
                 rule_raw.get("require_confirmation"), False
             )
-            if require_confirmation:
-                raise ValueError(
-                    f"profile_switching.rules[{index}].require_confirmation=true "
-                    "is unsupported in Milestone 1"
-                )
             rules.append(
                 ProfileSwitchRule(
                     profile=profile,
                     users=users,
                     chats=chats,
                     threads=threads,
-                    require_confirmation=False,
+                    require_confirmation=require_confirmation,
                 )
             )
 
         enabled = _coerce_bool(raw.get("enabled"), False)
         default_visible = profile_names("default_visible")
         hidden = profile_names("hidden")
-        high_risk_profiles = {"finance", "security", "production"}
-        served_high_risk = (
-            high_risk_profiles & set(multiplex_profile_allowlist or ())
-            if enabled
-            else set()
-        )
-        visible_high_risk = high_risk_profiles & set(default_visible)
-        rule_high_risk = high_risk_profiles & {rule.profile for rule in rules}
-        prohibited = served_high_risk | visible_high_risk | rule_high_risk
-        if prohibited:
-            profile = sorted(prohibited)[0]
-            raise ValueError(
-                f"profile {profile!r} cannot be served, visible, or switched "
-                "in Milestone 1; it may only be named in profile_switching.hidden"
-            )
-        overlap = set(default_visible) & set(hidden)
-        if overlap:
-            raise ValueError(
-                "profile_switching profiles cannot be both visible and hidden: "
-                f"{sorted(overlap)}"
-            )
-        _validate_profile_switching_gateway_contract(
-            enabled=enabled,
-            multiplex_profiles=multiplex_profiles,
-            multiplex_profile_allowlist=multiplex_profile_allowlist,
-        )
-        if multiplex_profile_allowlist is not None:
-            served_profiles = {"default", *multiplex_profile_allowlist}
-            unserved = set(default_visible) - served_profiles
-            if unserved:
-                raise ValueError(
-                    "profile_switching default_visible profiles are not served: "
-                    f"{sorted(unserved)}"
-                )
 
-        return cls(
+        parsed = cls(
             enabled=enabled,
-            picker_ttl_seconds=positive_int("picker_ttl_seconds", 300),
-            audit_retention_days=positive_int("audit_retention_days", 30),
-            audit_max_rows=positive_int("audit_max_rows", 10_000),
             default_visible=default_visible,
             hidden=hidden,
             admins=admins,
             rules=tuple(rules),
         )
+        parsed = _validate_profile_switching_policy_contract(
+            switching=parsed,
+            multiplex_profiles=multiplex_profiles,
+            multiplex_profile_allowlist=multiplex_profile_allowlist,
+            validate_process_owner=False,
+        )
+        return cls(
+            enabled=parsed.enabled,
+            picker_ttl_seconds=positive_int("picker_ttl_seconds", 300),
+            audit_retention_days=positive_int("audit_retention_days", 30),
+            audit_max_rows=positive_int("audit_max_rows", 10_000),
+            default_visible=parsed.default_visible,
+            hidden=parsed.hidden,
+            admins=parsed.admins,
+            rules=parsed.rules,
+        )
+
+
+def _canonical_profile_name_for_policy(value: object, key: str) -> str:
+    """Validate and canonicalize a typed policy profile without disk access."""
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    if not isinstance(value, str):
+        raise ValueError(f"{key} contains an invalid profile name")
+    try:
+        name = normalize_profile_name(value)
+        validate_profile_name(name)
+    except ValueError as exc:
+        raise ValueError(f"{key} contains an invalid profile name") from exc
+    return name
+
+
+def _validate_profile_switching_ids(values: object, key: str) -> tuple[str, ...]:
+    """Apply the parser's ID safety boundary to direct typed construction."""
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(f"{key} must be a list")
+    normalized: list[str] = []
+    for item in values:
+        if isinstance(item, (bool, dict, list, tuple, set)) or item is None:
+            raise ValueError(f"{key} contains an invalid ID")
+        normalized_id = str(item).strip()
+        if not normalized_id:
+            raise ValueError(f"{key} contains an invalid ID")
+        normalized.append(normalized_id)
+    return tuple(normalized)
+
+
+def _is_named_profile_home_path(path: Path) -> bool:
+    """Recognize a lexical ``<root>/profiles/<name>`` path without scanning."""
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    candidate = Path(os.path.abspath(path.expanduser()))
+    if candidate.parent.name.casefold() != "profiles":
+        return False
+    try:
+        profile_name = normalize_profile_name(candidate.name)
+        validate_profile_name(profile_name)
+    except ValueError:
+        return False
+    return profile_name != "default"
+
+
+def _process_home_is_named_profile(process_home: Path) -> bool:
+    """Fail closed for direct and symlink-aliased named launch homes."""
+    candidate = Path(process_home).expanduser()
+    seen: set[str] = set()
+    for _ in range(40):
+        candidate = Path(os.path.abspath(candidate))
+        key = os.path.normcase(str(candidate))
+        if key in seen:
+            break
+        seen.add(key)
+        if _is_named_profile_home_path(candidate):
+            return True
+        try:
+            if not candidate.is_symlink():
+                break
+            target = Path(os.readlink(candidate))
+        except OSError:
+            break
+        candidate = target if target.is_absolute() else candidate.parent / target
+
+    try:
+        return _is_named_profile_home_path(candidate.resolve(strict=False))
+    except (OSError, RuntimeError):
+        return False
+
+
+def _validate_profile_switching_policy_contract(
+    *,
+    switching: ProfileSwitchingConfig,
+    multiplex_profiles: bool,
+    multiplex_profile_allowlist: Optional[List[str]],
+    validate_process_owner: bool = True,
+) -> ProfileSwitchingConfig:
+    """Validate Milestone 1 policy semantics for parsed and direct configs.
+
+    This validator is intentionally path-pure except for the final process-owner
+    check: it never enumerates profiles. The owner check uses the process launch
+    home, not a context-local profile scope used while loading secondary config.
+    """
+    if not isinstance(switching.default_visible, (list, tuple)):
+        raise ValueError("profile_switching.default_visible must be a list")
+    if not isinstance(switching.hidden, (list, tuple)):
+        raise ValueError("profile_switching.hidden must be a list")
+    visible = tuple(
+        dict.fromkeys(
+            _canonical_profile_name_for_policy(
+                name, "profile_switching.default_visible"
+            )
+            for name in switching.default_visible
+        )
+    )
+    hidden = tuple(
+        dict.fromkeys(
+            _canonical_profile_name_for_policy(name, "profile_switching.hidden")
+            for name in switching.hidden
+        )
+    )
+
+    if not isinstance(switching.admins, dict):
+        raise ValueError("profile_switching.admins must be a mapping")
+    admins = {
+        str(platform): _validate_profile_switching_ids(
+            ids, f"profile_switching.admins.{platform}"
+        )
+        for platform, ids in switching.admins.items()
+    }
+
+    if not isinstance(switching.rules, (list, tuple)):
+        raise ValueError("profile_switching.rules must be a list")
+    rule_profiles: list[str] = []
+    seen_rule_profiles: set[str] = set()
+    normalized_rules: list[ProfileSwitchRule] = []
+    for index, rule in enumerate(switching.rules):
+        if not isinstance(rule, ProfileSwitchRule):
+            raise ValueError(f"profile_switching.rules[{index}] must be a rule")
+        profile = _canonical_profile_name_for_policy(
+            rule.profile, f"profile_switching.rules[{index}].profile"
+        )
+        if profile in seen_rule_profiles:
+            raise ValueError(
+                f"duplicate profile_switching rule for profile {profile!r}"
+            )
+        seen_rule_profiles.add(profile)
+        rule_profiles.append(profile)
+        users = _validate_profile_switching_ids(
+            rule.users, f"profile_switching.rules[{index}].users"
+        )
+        chats = _validate_profile_switching_ids(
+            rule.chats, f"profile_switching.rules[{index}].chats"
+        )
+        threads = _validate_profile_switching_ids(
+            rule.threads, f"profile_switching.rules[{index}].threads"
+        )
+        if threads and (not chats or "*" in chats):
+            raise ValueError(
+                f"profile_switching.rules[{index}].threads requires "
+                "concrete chat IDs and cannot use wildcard chats"
+            )
+        if _coerce_bool(rule.require_confirmation, False):
+            raise ValueError(
+                f"profile_switching.rules[{index}].require_confirmation=true "
+                "is unsupported in Milestone 1"
+            )
+        normalized_rules.append(
+            ProfileSwitchRule(
+                profile=profile,
+                users=users,
+                chats=chats,
+                threads=threads,
+                require_confirmation=False,
+            )
+        )
+
+    high_risk_profiles = {"finance", "security", "production"}
+    served_high_risk = (
+        high_risk_profiles & set(multiplex_profile_allowlist or ())
+        if switching.enabled is True
+        else set()
+    )
+    visible_high_risk = high_risk_profiles & set(visible)
+    rule_high_risk = high_risk_profiles & set(rule_profiles)
+    prohibited = served_high_risk | visible_high_risk | rule_high_risk
+    if prohibited:
+        profile = sorted(prohibited)[0]
+        raise ValueError(
+            f"profile {profile!r} cannot be served, visible, or switched "
+            "in Milestone 1; it may only be named in profile_switching.hidden"
+        )
+
+    overlap = set(visible) & set(hidden)
+    if overlap:
+        raise ValueError(
+            "profile_switching profiles cannot be both visible and hidden: "
+            f"{sorted(overlap)}"
+        )
+
+    _validate_profile_switching_gateway_contract(
+        enabled=switching.enabled,
+        multiplex_profiles=multiplex_profiles,
+        multiplex_profile_allowlist=multiplex_profile_allowlist,
+    )
+    if multiplex_profile_allowlist is not None:
+        served_profiles = {"default", *multiplex_profile_allowlist}
+        unserved = set(visible) - served_profiles
+        if unserved:
+            raise ValueError(
+                "profile_switching default_visible profiles are not served: "
+                f"{sorted(unserved)}"
+            )
+
+    if switching.enabled is True and validate_process_owner:
+        from hermes_constants import get_process_hermes_home
+        from hermes_cli.profiles import profile_matches_home
+
+        process_home = get_process_hermes_home()
+        if _process_home_is_named_profile(process_home) or not profile_matches_home(
+            "default", process_home
+        ):
+            raise ValueError(_PROFILE_SWITCHING_DEFAULT_PRIMARY_ERROR)
+
+    return ProfileSwitchingConfig(
+        enabled=switching.enabled,
+        picker_ttl_seconds=switching.picker_ttl_seconds,
+        audit_retention_days=switching.audit_retention_days,
+        audit_max_rows=switching.audit_max_rows,
+        default_visible=visible,
+        hidden=hidden,
+        admins=admins,
+        rules=tuple(normalized_rules),
+    )
 
 
 @dataclass
@@ -1292,13 +1477,17 @@ class GatewayConfig:
         self.multiplex_profile_allowlist = _normalize_multiplex_profile_allowlist(
             self.multiplex_profile_allowlist
         )
-        _validate_profile_switching_gateway_contract(
-            enabled=self.profile_switching.enabled,
-            multiplex_profiles=self.multiplex_profiles,
-            multiplex_profile_allowlist=self.multiplex_profile_allowlist,
-        )
+        self.validate_profile_switching_contract()
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
+        )
+
+    def validate_profile_switching_contract(self) -> None:
+        """Revalidate the switching policy and its process ownership boundary."""
+        self.profile_switching = _validate_profile_switching_policy_contract(
+            switching=self.profile_switching,
+            multiplex_profiles=self.multiplex_profiles,
+            multiplex_profile_allowlist=self.multiplex_profile_allowlist,
         )
 
     def get_connected_platforms(self) -> List[Platform]:
@@ -1423,7 +1612,7 @@ class GatewayConfig:
         }
         # Preserve the pre-feature serialized config shape by default. An
         # explicit feature-on config remains fully round-trippable.
-        if self.profile_switching.enabled:
+        if self.profile_switching.enabled is True:
             result["profile_switching"] = self.profile_switching.to_dict()
         return result
 
