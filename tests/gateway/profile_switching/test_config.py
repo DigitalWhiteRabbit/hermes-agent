@@ -432,6 +432,49 @@ def test_policy_error_precedes_positive_limit_error_like_legacy_parser():
         })
 
 
+@pytest.mark.parametrize(
+    "earlier_rules,error",
+    [
+        (
+            [
+                {"profile": "coder"},
+                {"profile": "Coder"},
+            ],
+            "duplicate.*coder",
+        ),
+        (
+            [
+                {
+                    "profile": "coder",
+                    "threads": ["thread-1"],
+                }
+            ],
+            "threads requires concrete chat IDs",
+        ),
+        (
+            [
+                {
+                    "profile": "coder",
+                    "require_confirmation": True,
+                }
+            ],
+            "require_confirmation=true.*unsupported",
+        ),
+    ],
+)
+def test_earlier_rule_error_precedes_later_malformed_id(earlier_rules, error):
+    with pytest.raises(ValueError, match=error):
+        GatewayConfig.from_dict({
+            "multiplex_profile_allowlist": ["coder", "writer"],
+            "profile_switching": {
+                "rules": [
+                    *earlier_rules,
+                    {"profile": "writer", "users": [True]},
+                ]
+            },
+        })
+
+
 def test_enabled_switching_accepts_explicit_empty_allowlist_as_default_only():
     cfg = GatewayConfig.from_dict({
         "gateway": {

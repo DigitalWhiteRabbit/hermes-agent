@@ -1077,6 +1077,7 @@ class ProfileSwitchingConfig:
         if not isinstance(rules_raw, (list, tuple)):
             raise ValueError("profile_switching.rules must be a list")
         rules = []
+        rule_profiles: set[str] = set()
         for index, rule_raw in enumerate(rules_raw):
             if not isinstance(rule_raw, dict):
                 raise ValueError(f"profile_switching.rules[{index}] must be a mapping")
@@ -1092,6 +1093,11 @@ class ProfileSwitchingConfig:
                 )
             profile = normalize_profile_name(rule_raw["profile"])
             validate_profile_name(profile)
+            if profile in rule_profiles:
+                raise ValueError(
+                    f"duplicate profile_switching rule for profile {profile!r}"
+                )
+            rule_profiles.add(profile)
             users = id_list(
                 rule_raw.get("users", ()),
                 f"profile_switching.rules[{index}].users",
@@ -1104,9 +1110,19 @@ class ProfileSwitchingConfig:
                 rule_raw.get("threads", ()),
                 f"profile_switching.rules[{index}].threads",
             )
+            if threads and (not chats or "*" in chats):
+                raise ValueError(
+                    f"profile_switching.rules[{index}].threads requires "
+                    "concrete chat IDs and cannot use wildcard chats"
+                )
             require_confirmation = _coerce_bool(
                 rule_raw.get("require_confirmation"), False
             )
+            if require_confirmation:
+                raise ValueError(
+                    f"profile_switching.rules[{index}].require_confirmation=true "
+                    "is unsupported in Milestone 1"
+                )
             rules.append(
                 ProfileSwitchRule(
                     profile=profile,
