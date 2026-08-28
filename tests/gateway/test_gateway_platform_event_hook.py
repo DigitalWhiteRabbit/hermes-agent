@@ -576,7 +576,7 @@ class TestProfileScopedPlatformEventHandler:
         dispatch = AsyncMock()
         runner._handle_gateway_platform_event = dispatch
         handler = runner._make_default_profile_platform_event_handler()
-        with patch("gateway.run._profile_runtime_scope", side_effect=lambda _home: nullcontext()):
+        with patch("gateway.run._profile_runtime_scope", return_value=nullcontext()):
             asyncio.run(handler({"event_type": "reaction"}, source))
 
         resolver.assert_called_once_with(source)
@@ -584,6 +584,9 @@ class TestProfileScopedPlatformEventHandler:
 
     def test_secondary_handler_stamps_profile_before_dispatch(self, monkeypatch):
         runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(
+            profile_switching=SimpleNamespace(enabled=False),
+        )
         captured = {}
 
         async def dispatch(event, source):
@@ -602,6 +605,42 @@ class TestProfileScopedPlatformEventHandler:
         asyncio.run(handler({"platform": "telegram", "event_type": "reaction", "payload": {}}, source))
 
         assert captured["profile"] == "work"
+
+    def test_secondary_feature_stamps_transport_provenance_before_dispatch(
+        self, monkeypatch,
+    ):
+        runner = object.__new__(GatewayRunner)
+        runner.config = SimpleNamespace(
+            profile_switching=SimpleNamespace(enabled=True),
+        )
+        captured = {}
+
+        async def dispatch(event, source):
+            captured["provenance"] = (
+                source.profile,
+                source.transport_owner_profile,
+                source.transport_platform,
+            )
+
+        runner._handle_gateway_platform_event = dispatch
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda name: None,
+        )
+        handler = runner._make_profile_platform_event_handler("work")
+        source = _adapter()._source_from_reaction_for_auth(
+            _auth_reaction_update(user_id=777)
+        )
+
+        asyncio.run(handler(
+            {"platform": "telegram", "event_type": "reaction", "payload": {}},
+            source,
+        ))
+
+        assert captured["provenance"] == (
+            "work",
+            "work",
+            Platform.TELEGRAM,
+        )
 
 
 class TestFixturePluginObservationPath:

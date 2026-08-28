@@ -3809,7 +3809,10 @@ class BasePlatformAdapter(ABC):
         if recovered is None or str(recovered) == str(source.thread_id or ""):
             return
         try:
-            event.source = dataclasses.replace(source, thread_id=str(recovered))
+            replacement = dataclasses.replace(source, thread_id=str(recovered))
+            if hasattr(source, "_transport_adapter_ref"):
+                replacement._transport_adapter_ref = source._transport_adapter_ref
+            event.source = replacement
         except Exception:
             logger.debug("topic recovery rewrite failed", exc_info=True)
 
@@ -6190,6 +6193,41 @@ class BasePlatformAdapter(ABC):
         )
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
+
+        # Dynamic profile routing must precede this adapter-level busy/session
+        # key. Runner wrappers repeat the same helper after the guard as an
+        # idempotent safety net and preserve their transport authorization
+        # homes independently from the resolved runtime profile.
+        runner = getattr(self, "gateway_runner", None)
+        dynamic_enabled = (
+            getattr(
+                getattr(getattr(runner, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
+        if dynamic_enabled:
+            owner_profile = getattr(self, "_owner_profile", None)
+            if isinstance(owner_profile, str) and owner_profile.strip():
+                # A secondary adapter is a distinct transport account. Until
+                # configured account aliases exist, shared ``:primary``
+                # bindings must never cross into that account's namespace.
+                event.source.profile = owner_profile
+                event.source.transport_owner_profile = owner_profile
+                event.source.transport_platform = self.platform
+            else:
+                resolve_profile = getattr(
+                    runner,
+                    "_resolve_dynamic_profile_for_event",
+                    None,
+                )
+                if callable(resolve_profile):
+                    resolution = resolve_profile(event)
+                    if inspect.isawaitable(resolution):
+                        await resolution
+                    if getattr(event.source, "_profile_transport_drop", False):
+                        return
 
         session_key = build_session_key(
             event.source,

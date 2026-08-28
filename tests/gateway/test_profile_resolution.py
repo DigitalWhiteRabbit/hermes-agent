@@ -387,3 +387,19 @@ class TestMultiplexGate:
         assert mock_runner._profile_name_for_source(discord_source) is None
 
 
+def test_disabled_profile_switching_is_inert_and_creates_no_routing_db():
+    """Feature-off construction preserves the legacy namespace and filesystem."""
+    from hermes_constants import get_hermes_home
+
+    runner = GatewayRunner(GatewayConfig())
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="user-1",
+    )
+
+    assert runner._profile_switching_service is None
+    assert build_session_key(source) == "agent:main:telegram:dm:chat-1"
+    assert not (get_hermes_home() / "state" / "profile-routing.db").exists()
+

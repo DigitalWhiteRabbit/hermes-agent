@@ -218,6 +218,19 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+    # Profile whose live adapter admitted this message. This remains separate
+    # from ``profile`` because dynamic routing changes the runtime/session
+    # namespace without changing which bot account owns replies. Optional for
+    # backward compatibility: legacy persisted sources fall back to the
+    # historical runtime-profile adapter lookup. Both provenance fields stay
+    # at the end so older positional constructors retain every field index.
+    transport_owner_profile: Optional[str] = None
+    # Platform/kind of the adapter that admitted this message. Relay ingress
+    # deliberately keeps the underlying platform in ``platform`` for session
+    # namespacing, so owner profile alone cannot recover the transport after a
+    # restart when both Relay and a native adapter are live. Appended after all
+    # pre-existing fields to preserve positional-constructor compatibility.
+    transport_platform: Optional[Platform] = None
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
@@ -228,6 +241,11 @@ class SessionSource:
             self.scope_id = self.guild_id
         elif self.scope_id is not None:
             self.guild_id = self.scope_id
+        # The authenticated relay socket is authoritative for live ingress.
+        # Persist its transport kind separately while retaining the underlying
+        # source platform for session keys and display/routing behavior.
+        if self.delivered_via_upstream_relay is True:
+            self.transport_platform = Platform.RELAY
 
     @property
     def description(self) -> str:
@@ -279,6 +297,10 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.transport_owner_profile:
+            d["transport_owner_profile"] = self.transport_owner_profile
+        if self.transport_platform:
+            d["transport_platform"] = self.transport_platform.value
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -289,6 +311,15 @@ class SessionSource:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
+        transport_platform = None
+        if data.get("transport_platform"):
+            try:
+                transport_platform = Platform(data["transport_platform"])
+            except (TypeError, ValueError):
+                # Unknown provenance from a newer writer is non-authoritative;
+                # retain the legacy adapter lookup instead of rejecting the
+                # entire persisted session row.
+                transport_platform = None
         return cls(
             platform=Platform(data["platform"]),
             chat_id=str(data["chat_id"]),
@@ -306,6 +337,8 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            transport_owner_profile=data.get("transport_owner_profile"),
+            transport_platform=transport_platform,
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
@@ -1218,6 +1251,17 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
+@dataclass
+class _OriginRefreshLock:
+    """One ref-counted FIFO serialization boundary for a stable session key."""
+
+    condition: Any = field(default_factory=threading.Condition)
+    references: int = 0
+    next_ticket: int = 0
+    serving_ticket: int = 0
+    cancelled_tickets: set[int] = field(default_factory=set)
+
+
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
@@ -1274,6 +1318,12 @@ class SessionStore:
         self._fast_persisted_entries: Dict[str, tuple[int, str]] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
+        # ``_SessionFlight`` ends when its owner publishes, before all waiters
+        # finish refreshing transport provenance.  This separate keyed
+        # registry therefore outlives a flight and orders the complete
+        # memory -> routing -> peer persistence sequence for one session.
+        self._origin_refresh_registry_lock = threading.Lock()
+        self._origin_refresh_registry: Dict[str, _OriginRefreshLock] = {}
         # An unscoped pre-migration Slack key can represent at most one
         # workspace. Claim it once per process so simultaneous first messages
         # from two workspaces cannot both revive the same legacy session.
@@ -1326,6 +1376,189 @@ class SessionStore:
             lock=self._db_handles_lock,
         )
         self._open_session_db_for_active_scope()
+
+    def _transport_provenance_enabled(self) -> bool:
+        """Return whether dynamic transport provenance is part of persistence."""
+        return (
+            getattr(getattr(self.config, "profile_switching", None), "enabled", False)
+            is True
+        )
+
+    def _source_for_persistence(self, source: SessionSource) -> SessionSource:
+        """Preserve the pre-feature wire shape while profile switching is off."""
+        if self._transport_provenance_enabled():
+            return source
+        if (
+            getattr(source, "transport_owner_profile", None) is None
+            and getattr(source, "transport_platform", None) is None
+        ):
+            return source
+        persisted = replace(source)
+        # ``replace`` invokes __post_init__, which may infer Relay again from
+        # the in-process trust bit. Clear only the two new durable provenance
+        # fields after construction; the trust bit itself was already wire-
+        # invisible before this feature and remains live-turn state.
+        persisted.transport_owner_profile = None
+        persisted.transport_platform = None
+        return persisted
+
+    def _entry_from_dict(self, data: Dict[str, Any]) -> SessionEntry:
+        entry = SessionEntry.from_dict(data)
+        if entry.origin is not None:
+            entry.origin = self._source_for_persistence(entry.origin)
+        return entry
+
+    def _refresh_dynamic_origin_for_turn(
+        self,
+        entry: SessionEntry,
+        source: SessionSource,
+        *,
+        touch_activity: bool = False,
+    ) -> None:
+        """Durably refresh feature-on origin/provenance for every accepted turn."""
+        if not self._transport_provenance_enabled():
+            return
+        refresh_lock = self._acquire_origin_refresh_lock(entry.session_key)
+        try:
+            with self._lock:
+                current = self._entries.get(entry.session_key)
+                if current is None or current.session_id != entry.session_id:
+                    return
+                current.origin = source
+                current.platform = source.platform
+                current.chat_type = source.chat_type
+                current.display_name = source.chat_name
+                if touch_activity:
+                    current.updated_at = _now()
+                # Capture the structural routing view and peer payload from
+                # the same accepted source while the live entry is stable.
+                routing_data, routing_generation = self._snapshot_routing_locked()
+                peer_session_id = current.session_id
+                peer_display_name = current.display_name
+
+            # Never hold SessionStore._lock (or either registry guard) across
+            # SQLite / fsync.  The keyed lock alone preserves source ordering
+            # through both durable stores.
+            self._persist_origin_commit(
+                routing_data,
+                routing_generation,
+                peer_session_id,
+                entry.session_key,
+                source,
+                display_name=peer_display_name,
+            )
+        finally:
+            self._release_origin_refresh_lock(entry.session_key, refresh_lock)
+
+    def _acquire_origin_refresh_lock(self, session_key: str) -> _OriginRefreshLock:
+        """Acquire a FIFO ticket without holding the registry guard while waiting."""
+        with self._origin_refresh_registry_lock:
+            keyed = self._origin_refresh_registry.get(session_key)
+            if keyed is None:
+                keyed = _OriginRefreshLock()
+                self._origin_refresh_registry[session_key] = keyed
+            keyed.references += 1
+        with keyed.condition:
+            ticket = keyed.next_ticket
+            keyed.next_ticket += 1
+            try:
+                while ticket != keyed.serving_ticket:
+                    keyed.condition.wait()
+            except BaseException:
+                keyed.cancelled_tickets.add(ticket)
+                self._advance_origin_refresh_ticket_locked(keyed)
+                keyed.condition.notify_all()
+                self._drop_origin_refresh_reference(session_key, keyed)
+                raise
+        return keyed
+
+    @staticmethod
+    def _advance_origin_refresh_ticket_locked(keyed: _OriginRefreshLock) -> None:
+        """Skip cancelled FIFO tickets while the keyed condition is held."""
+        while keyed.serving_ticket in keyed.cancelled_tickets:
+            keyed.cancelled_tickets.remove(keyed.serving_ticket)
+            keyed.serving_ticket += 1
+
+    def _drop_origin_refresh_reference(
+        self,
+        session_key: str,
+        keyed: _OriginRefreshLock,
+    ) -> None:
+        """Drop one holder/waiter reference and remove an unused serializer."""
+        with self._origin_refresh_registry_lock:
+            keyed.references -= 1
+            if (
+                keyed.references == 0
+                and self._origin_refresh_registry.get(session_key) is keyed
+            ):
+                self._origin_refresh_registry.pop(session_key, None)
+
+    def _release_origin_refresh_lock(
+        self,
+        session_key: str,
+        keyed: _OriginRefreshLock,
+    ) -> None:
+        """Release and remove an unused keyed provenance serializer."""
+        with keyed.condition:
+            keyed.serving_ticket += 1
+            self._advance_origin_refresh_ticket_locked(keyed)
+            keyed.condition.notify_all()
+        self._drop_origin_refresh_reference(session_key, keyed)
+
+    def _persist_origin_commit(
+        self,
+        routing_data: Dict[str, Any],
+        routing_generation: int,
+        session_id: str,
+        session_key: str,
+        source: Optional[SessionSource],
+        *,
+        display_name: Optional[str],
+    ) -> None:
+        """Persist every enabled provenance view or signal an incomplete commit."""
+        try:
+            self._persist_routing_data(
+                routing_data,
+                routing_generation,
+                strict=True,
+            )
+            self._record_gateway_session_peer(
+                session_id,
+                session_key,
+                source,
+                display_name=display_name,
+                strict=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"origin provenance persistence failed for {session_key}"
+            ) from exc
+
+    def _record_current_gateway_session_peer(
+        self,
+        session_key: str,
+        expected_session_id: str,
+        *,
+        include_compression_ancestors: bool = False,
+    ) -> None:
+        """Record a lifecycle peer from the current entry under origin ordering."""
+        refresh_lock = self._acquire_origin_refresh_lock(session_key)
+        try:
+            with self._lock:
+                current = self._entries.get(session_key)
+                if current is None or current.session_id != expected_session_id:
+                    return
+                source = current.origin
+                display_name = current.display_name
+            self._record_gateway_session_peer(
+                expected_session_id,
+                session_key,
+                source,
+                display_name=display_name,
+                include_compression_ancestors=include_compression_ancestors,
+            )
+        finally:
+            self._release_origin_refresh_lock(session_key, refresh_lock)
 
     def _open_session_db_for_active_scope(self):
         """Return the SessionDB for the profile scope active on this task.
@@ -1479,7 +1712,7 @@ class SessionStore:
                         try:
                             entry_data = json.loads(entry_json)
                             if isinstance(entry_data, dict):
-                                self._entries[key] = SessionEntry.from_dict(entry_data)
+                                self._entries[key] = self._entry_from_dict(entry_data)
                         except (ValueError, KeyError, TypeError) as e:
                             logger.warning(
                                 "Skipping invalid routing entry %r: %s", key, e
@@ -1521,7 +1754,7 @@ class SessionStore:
                         )
                         continue
                     try:
-                        self._entries[key] = SessionEntry.from_dict(entry_data)
+                        self._entries[key] = self._entry_from_dict(entry_data)
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning("Skipping invalid session entry %r: %s", key, e)
@@ -1696,7 +1929,7 @@ class SessionStore:
                 entry_data = json.loads(entry_json)
                 if not isinstance(entry_data, dict):
                     continue
-                durable_entry = SessionEntry.from_dict(entry_data)
+                durable_entry = self._entry_from_dict(entry_data)
             except (ValueError, KeyError, TypeError) as exc:
                 logger.warning("Skipping invalid routing entry %r: %s", key, exc)
                 continue
@@ -1723,8 +1956,14 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+    def _persist_routing_data(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        strict: bool = False,
+    ) -> None:
+        """Serialize whole-index writers, optionally requiring every enabled view."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
@@ -1743,6 +1982,7 @@ class SessionStore:
                     if revision > generation:
                         data[key] = json.loads(entry_json)
             db_saved = False
+            db_error: Optional[Exception] = None
             _db = getattr(self, "_db", None)
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
@@ -1754,22 +1994,31 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
+                        db_error = exc
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
+            json_error: Optional[Exception] = None
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
                     self._save_sessions_json(data)
                 except Exception as exc:
+                    json_error = exc
                     if not db_saved:
-                        raise
-                    # state.db is authoritative. A failed legacy mirror must not
-                    # report the already-committed primary write as failed.
+                        if not strict:
+                            raise
+                    # Best-effort callers accept the authoritative state.db
+                    # commit. Strict provenance callers report the incomplete
+                    # mirror below so the next accepted turn can heal it.
                     logger.warning(
                         "gateway.session: sessions.json mirror save failed "
                         "after state.db commit: %s",
                         exc,
                     )
+            if strict and (db_error is not None or json_error is not None):
+                failure = db_error if db_error is not None else json_error
+                assert failure is not None
+                raise failure
             self._persisted_routing_generation = generation
             # This rewrite supersedes fast records at or below its
             # generation; newer ones stay for the next delayed full writer.
@@ -2315,10 +2564,12 @@ class SessionStore:
         source: Optional[SessionSource],
         display_name: Optional[str] = None,
         include_compression_ancestors: bool = False,
+        strict: bool = False,
     ) -> None:
         """Persist the routing peer for an existing gateway session row."""
         if not self._db or not source:
             return
+        source = self._source_for_persistence(source)
         recorder = getattr(self._db, "record_gateway_session_peer", None)
         if not callable(recorder):
             return
@@ -2341,6 +2592,8 @@ class SessionStore:
                 include_compression_ancestors=include_compression_ancestors,
             )
         except TypeError:
+            if strict:
+                raise
             # Older SessionDB without display_name/origin_json kwargs.
             try:
                 recorder(
@@ -2355,6 +2608,8 @@ class SessionStore:
             except Exception as exc:
                 logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
         except Exception as exc:
+            if strict:
+                raise
             logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
 
     def set_expiry_finalized(
@@ -2648,7 +2903,12 @@ class SessionStore:
             if slot.error is not None:
                 raise slot.error
             assert slot.result is not None
-            if touch_activity:
+            self._refresh_dynamic_origin_for_turn(
+                slot.result,
+                source,
+                touch_activity=touch_activity,
+            )
+            if touch_activity and not self._transport_provenance_enabled():
                 self.update_session(slot.result.session_key)
             return slot.result
 
@@ -2658,6 +2918,7 @@ class SessionStore:
                 force_new=force_new,
                 touch_activity=touch_activity,
             )
+            self._refresh_dynamic_origin_for_turn(result, source)
             slot.result = result
             return result
         except BaseException as exc:
@@ -2682,6 +2943,7 @@ class SessionStore:
         """
         session_key = self._generate_session_key(source)
         now = _now()
+        persisted_source = self._source_for_persistence(source)
 
         # One-time routing-index migration for Slack sessions created before
         # workspace scope was part of the key. Move (rather than copy) the
@@ -2716,7 +2978,7 @@ class SessionStore:
                     if adopt and self._claim_legacy_slack_key(legacy_key):
                         migrated_legacy_entry = self._entries.pop(legacy_key)
                         migrated_legacy_entry.session_key = session_key
-                        migrated_legacy_entry.origin = source
+                        migrated_legacy_entry.origin = persisted_source
                         migrated_legacy_entry.platform = source.platform
                         migrated_legacy_entry.chat_type = source.chat_type
                         self._entries[session_key] = migrated_legacy_entry
@@ -2915,7 +3177,7 @@ class SessionStore:
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
-                origin=source,
+                origin=persisted_source,
                 display_name=source.chat_name,
                 platform=source.platform,
                 chat_type=source.chat_type,
@@ -2939,7 +3201,7 @@ class SessionStore:
             _needs_save = True
             if entry is candidate:
                 try:
-                    _origin_json = json.dumps(source.to_dict())
+                    _origin_json = json.dumps(persisted_source.to_dict())
                 except Exception:
                     _origin_json = None
                 db_create_kwargs = {
@@ -3005,7 +3267,7 @@ class SessionStore:
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
-                    source,
+                    persisted_source,
                     display_name=entry.display_name,
                 )
             except Exception as e:
@@ -3032,6 +3294,40 @@ class SessionStore:
         Internal/system turns can persist token metadata without advancing the
         user-activity clock that drives idle and daily reset policy.
         """
+        if self._transport_provenance_enabled():
+            refresh_lock = self._acquire_origin_refresh_lock(session_key)
+            try:
+                with self._lock:
+                    self._ensure_loaded_locked()
+                    entry = self._entries.get(session_key)
+                    if entry is None:
+                        return
+                    if touch_activity:
+                        entry.updated_at = _now()
+                    if last_prompt_tokens is not None:
+                        entry.last_prompt_tokens = last_prompt_tokens
+                    peer_session_id = entry.session_id
+
+                # Metadata does not change transport provenance or the route.
+                # Keep the per-entry UPSERT fast path while the keyed boundary
+                # prevents a later stale peer write from crossing a refresh.
+                self._save_entry(session_key)
+                with self._lock:
+                    current = self._entries.get(session_key)
+                    if current is None or current.session_id != peer_session_id:
+                        return
+                    peer_origin = current.origin
+                    peer_display_name = current.display_name
+                self._record_gateway_session_peer(
+                    peer_session_id,
+                    session_key,
+                    peer_origin,
+                    display_name=peer_display_name,
+                )
+            finally:
+                self._release_origin_refresh_lock(session_key, refresh_lock)
+            return
+
         with self._lock:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
@@ -3494,12 +3790,18 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
-                self._record_gateway_session_peer(
-                    session_id,
-                    session_key,
-                    old_entry.origin,
-                    display_name=new_entry.display_name if new_entry else None,
-                )
+                if self._transport_provenance_enabled():
+                    self._record_current_gateway_session_peer(
+                        session_key,
+                        session_id,
+                    )
+                else:
+                    self._record_gateway_session_peer(
+                        session_id,
+                        session_key,
+                        old_entry.origin,
+                        display_name=new_entry.display_name if new_entry else None,
+                    )
             except Exception as e:
                 logger.warning(
                     "Failed to create session row %s for %s during reset: %s "
@@ -3609,13 +3911,20 @@ class SessionStore:
                 self._db.reopen_session(target_session_id)
             except Exception as e:
                 logger.debug("Session DB reopen_session failed: %s", e)
-            self._record_gateway_session_peer(
-                target_session_id,
-                session_key,
-                new_entry.origin if new_entry else None,
-                display_name=new_entry.display_name if new_entry else None,
-                include_compression_ancestors=True,
-            )
+            if self._transport_provenance_enabled():
+                self._record_current_gateway_session_peer(
+                    session_key,
+                    target_session_id,
+                    include_compression_ancestors=True,
+                )
+            else:
+                self._record_gateway_session_peer(
+                    target_session_id,
+                    session_key,
+                    new_entry.origin if new_entry else None,
+                    display_name=new_entry.display_name if new_entry else None,
+                    include_compression_ancestors=True,
+                )
 
         return new_entry
 

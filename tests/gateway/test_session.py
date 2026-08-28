@@ -1,12 +1,20 @@
 """Tests for gateway session management."""
 import json
 import pytest
-from dataclasses import replace
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 from hermes_state import SessionDB
-from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
+from gateway.config import (
+    Platform,
+    HomeChannel,
+    GatewayConfig,
+    PlatformConfig,
+    ProfileSwitchingConfig,
+)
 from gateway.platforms.base import MessageEvent
 from gateway.session import (
     SessionEntry,
@@ -56,12 +64,47 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
 
+    def test_transport_owner_profile_roundtrip_and_legacy_default(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            profile="coder",
+            transport_owner_profile="default",
+            transport_platform=Platform.RELAY,
+        )
+
+        serialized = source.to_dict()
+        restored = SessionSource.from_dict(serialized)
+        legacy = SessionSource.from_dict({
+            "platform": "telegram",
+            "chat_id": "12345",
+            "profile": "coder",
+        })
+
+        assert serialized["transport_owner_profile"] == "default"
+        assert serialized["transport_platform"] == "relay"
+        assert restored.profile == "coder"
+        assert restored.transport_owner_profile == "default"
+        assert restored.transport_platform == Platform.RELAY
+        assert legacy.profile == "coder"
+        assert legacy.transport_owner_profile is None
+        assert legacy.transport_platform is None
+
+    def test_transport_provenance_fields_are_appended_for_positional_compatibility(
+        self,
+    ):
+        names = [item.name for item in fields(SessionSource)]
+
+        assert names[-2:] == ["transport_owner_profile", "transport_platform"]
+
 
 class TestSessionSourceDescription:
     def test_local_cli(self):
         source = SessionSource(
-            platform=Platform.LOCAL, chat_id="cli",
-            chat_name="CLI terminal", chat_type="dm",
+            platform=Platform.LOCAL,
+            chat_id="cli",
+            chat_name="CLI terminal",
+            chat_type="dm",
         )
         assert source.description == "CLI terminal"
 
@@ -1630,6 +1673,861 @@ class TestGatewayRoutingTable:
         assert rehydrated.model_override == {"model": "test-model"}
         restarted._db.close()
 
+    def test_dynamic_transport_owner_survives_database_restart(self, tmp_path):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = self._source()
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+        entry = store.get_or_create_session(source)
+
+        (tmp_path / "sessions.json").unlink()
+        store._db.close()
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        restored = restarted._entries[entry.session_key].origin
+
+        assert entry.session_key == "agent:coder:telegram:dm:chat-1"
+        assert restored is not None
+        assert restored.profile == "coder"
+        assert restored.transport_owner_profile == "default"
+        assert restored.transport_platform == Platform.RELAY
+        restarted._db.close()
+
+    def test_dynamic_transport_provenance_survives_sessions_json_restart(
+        self, tmp_path
+    ):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = None
+        source = self._source()
+        source.platform = Platform.DISCORD
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+        entry = store.get_or_create_session(source)
+
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._db = None
+        restarted._ensure_loaded()
+        restored = restarted._entries[entry.session_key].origin
+
+        assert entry.session_key == "agent:coder:discord:dm:chat-1"
+        assert restored is not None
+        assert restored.profile == "coder"
+        assert restored.transport_owner_profile == "default"
+        assert restored.transport_platform == Platform.RELAY
+
+    @pytest.mark.parametrize(
+        ("first_transport", "second_transport"),
+        [
+            (Platform.TELEGRAM, Platform.RELAY),
+            (Platform.RELAY, Platform.TELEGRAM),
+        ],
+    )
+    def test_reused_dynamic_session_refreshes_origin_in_database_and_json(
+        self, tmp_path, first_transport, second_transport
+    ):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        first = self._source()
+        first.profile = "coder"
+        first.transport_owner_profile = "default"
+        first.transport_platform = first_transport
+        original = store.get_or_create_session(first)
+
+        second = self._source()
+        second.profile = "coder"
+        second.transport_owner_profile = "default"
+        second.transport_platform = second_transport
+        reused = store.get_or_create_session(second)
+
+        assert reused.session_id == original.session_id
+        assert reused.origin is second
+        assert reused.origin.transport_platform == second_transport
+
+        sessions_json = json.loads((tmp_path / "sessions.json").read_text())
+        persisted_json = SessionEntry.from_dict(sessions_json[reused.session_key])
+        assert persisted_json.origin is not None
+        assert persisted_json.origin.transport_platform == second_transport
+
+        session_row = store._db.get_session(reused.session_id)
+        assert session_row is not None
+        session_origin = json.loads(session_row["origin_json"])
+        assert session_origin["transport_platform"] == second_transport.value
+        assert session_row["display_name"] == "Alice"
+        peer_lookup = store._db.find_latest_gateway_session_for_peer(
+            source="telegram",
+            user_id="user-1",
+            session_key=reused.session_key,
+            chat_id="chat-1",
+            chat_type="dm",
+        )
+        assert peer_lookup is not None
+        peer_origin = json.loads(peer_lookup["origin_json"])
+        assert peer_origin["transport_platform"] == second_transport.value
+        assert peer_lookup["display_name"] == "Alice"
+
+        (tmp_path / "sessions.json").unlink()
+        store._db.close()
+        restarted = SessionStore(sessions_dir=tmp_path, config=config)
+        restarted._ensure_loaded()
+        persisted_db = restarted._entries[reused.session_key]
+        assert persisted_db.session_id == original.session_id
+        assert persisted_db.origin is not None
+        assert persisted_db.origin.transport_platform == second_transport
+        restarted._db.close()
+
+    @pytest.mark.parametrize("touch_activity", [False, True])
+    @pytest.mark.parametrize(
+        ("first_transport", "final_transport"),
+        [
+            (Platform.TELEGRAM, Platform.RELAY),
+            (Platform.RELAY, Platform.TELEGRAM),
+        ],
+    )
+    def test_concurrent_reused_origin_refresh_keeps_all_durable_views_consistent(
+        self,
+        tmp_path,
+        touch_activity,
+        first_transport,
+        final_transport,
+    ):
+        """A completed later waiter must be the source in every durable view.
+
+        The two followers share one ``_SessionFlight``.  A reaches the peer
+        write first and is held there while B persists.  Before the fix, A's
+        unversioned peer write then lands last even though routing/live state
+        already contain B.  The coordination uses Events only; no scheduling
+        delay is part of the assertion.
+        """
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        prior_updated_at = datetime(2000, 1, 2, 3, 4, 5)
+
+        def source(name, transport):
+            value = self._source()
+            value.profile = "coder"
+            value.chat_name = name
+            value.transport_owner_profile = "default"
+            value.transport_platform = transport
+            return value
+
+        owner_source = source("owner", first_transport)
+        source_a = source("native-A", first_transport)
+        source_b = source("relay-B", final_transport)
+
+        owner_in_impl = threading.Event()
+        release_owner = threading.Event()
+        a_peer_started = threading.Event()
+        release_a_peer = threading.Event()
+        b_waiter_released = threading.Event()
+        b_peer_finished = threading.Event()
+        follower_waiting = {"A": threading.Event(), "B": threading.Event()}
+        follower_label = threading.local()
+
+        original_impl = store._get_or_create_session_impl
+        original_record = store._record_gateway_session_peer
+
+        def blocked_impl(incoming, *args, **kwargs):
+            if incoming.chat_name == "owner":
+                result = original_impl(incoming, *args, **kwargs)
+                with store._lock:
+                    result.updated_at = prior_updated_at
+                owner_in_impl.set()
+                assert release_owner.wait(timeout=10)
+                return result
+            return original_impl(incoming, *args, **kwargs)
+
+        def ordered_record(session_id, session_key, incoming, *args, **kwargs):
+            if incoming is not None and incoming.chat_name == "native-A":
+                a_peer_started.set()
+                assert release_a_peer.wait(timeout=10)
+            result = original_record(session_id, session_key, incoming, *args, **kwargs)
+            if incoming is not None and incoming.chat_name == "relay-B":
+                b_peer_finished.set()
+            return result
+
+        store._get_or_create_session_impl = blocked_impl  # type: ignore[method-assign]
+        store._record_gateway_session_peer = ordered_record  # type: ignore[method-assign]
+
+        def follower(label, incoming):
+            follower_label.value = label
+            return store.get_or_create_session(
+                incoming,
+                touch_activity=touch_activity,
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            owner_future = pool.submit(store.get_or_create_session, owner_source)
+            assert owner_in_impl.wait(timeout=10)
+            session_key = store._generate_session_key(owner_source)
+            with store._inflight_lock:
+                flight = store._inflight_sessions[session_key]
+            original_wait = flight.event.wait
+
+            def ordered_wait(*args, **kwargs):
+                label = follower_label.value
+                follower_waiting[label].set()
+                result = original_wait(*args, **kwargs)
+                if label == "B":
+                    assert a_peer_started.wait(timeout=10)
+                    b_waiter_released.set()
+                return result
+
+            flight.event.wait = ordered_wait  # type: ignore[method-assign]
+            a_future = pool.submit(follower, "A", source_a)
+            assert follower_waiting["A"].wait(timeout=10)
+            b_future = pool.submit(follower, "B", source_b)
+            assert follower_waiting["B"].wait(timeout=10)
+            release_owner.set()
+            assert a_peer_started.wait(timeout=10)
+            assert b_waiter_released.wait(timeout=10)
+
+            # On the buggy implementation B can reach its peer write while A
+            # is paused.  With the keyed serializer B is waiting behind A, so
+            # release A as soon as B has entered the refresh operation.
+            if hasattr(store, "_origin_refresh_registry"):
+                release_a_peer.set()
+            else:
+                assert b_peer_finished.wait(timeout=10)
+                release_a_peer.set()
+
+            owner = owner_future.result(timeout=10)
+            refreshed_a = a_future.result(timeout=10)
+            refreshed_b = b_future.result(timeout=10)
+
+        assert owner.session_id == refreshed_a.session_id == refreshed_b.session_id
+        live = store._entries[session_key]
+        assert live.origin is source_b
+        assert live.origin.transport_platform == final_transport
+        assert live.display_name == "relay-B"
+        if touch_activity:
+            assert live.updated_at > prior_updated_at
+        else:
+            assert live.updated_at == prior_updated_at
+
+        sessions_json = json.loads((tmp_path / "sessions.json").read_text())
+        json_entry = SessionEntry.from_dict(sessions_json[session_key])
+        assert json_entry.origin is not None
+        assert json_entry.origin.transport_platform == final_transport
+        assert json_entry.display_name == "relay-B"
+        if touch_activity:
+            assert json_entry.updated_at > prior_updated_at
+        else:
+            assert json_entry.updated_at == prior_updated_at
+
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing_entry = SessionEntry.from_dict(json.loads(routing_rows[session_key]))
+        assert routing_entry.origin is not None
+        assert routing_entry.origin.transport_platform == final_transport
+        assert routing_entry.display_name == "relay-B"
+        if touch_activity:
+            assert routing_entry.updated_at > prior_updated_at
+        else:
+            assert routing_entry.updated_at == prior_updated_at
+
+        session_row = store._db.get_session(owner.session_id)
+        assert session_row is not None
+        session_origin = json.loads(session_row["origin_json"])
+        assert session_origin["transport_platform"] == final_transport.value
+        assert session_row["display_name"] == "relay-B"
+
+        peer_lookup = store._db.find_latest_gateway_session_for_peer(
+            source="telegram",
+            user_id="user-1",
+            session_key=session_key,
+            chat_id="chat-1",
+            chat_type="dm",
+        )
+        assert peer_lookup is not None
+        peer_origin = json.loads(peer_lookup["origin_json"])
+        assert peer_origin["transport_platform"] == final_transport.value
+        assert peer_lookup["display_name"] == "relay-B"
+
+    def test_feature_on_update_session_cannot_regress_newer_origin_commit(
+        self, tmp_path
+    ):
+        """A stale metadata writer cannot overwrite a completed origin commit."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        source_a = self._source()
+        source_a.profile = "coder"
+        source_a.chat_name = "native-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        entry = store.get_or_create_session(source_a)
+
+        source_b = self._source()
+        source_b.profile = "coder"
+        source_b.chat_name = "relay-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        update_at_peer = threading.Event()
+        release_update = threading.Event()
+        update_has_serializer = threading.Event()
+        refresh_attempted_serializer = threading.Event()
+        actor = threading.local()
+        original_acquire = store._acquire_origin_refresh_lock
+        original_record = store._record_gateway_session_peer
+
+        def observed_acquire(session_key):
+            label = getattr(actor, "label", None)
+            if label == "refresh":
+                refresh_attempted_serializer.set()
+            keyed = original_acquire(session_key)
+            if label == "update":
+                update_has_serializer.set()
+            return keyed
+
+        def blocked_record(session_id, session_key, incoming, *args, **kwargs):
+            if getattr(actor, "label", None) == "update":
+                update_at_peer.set()
+                assert release_update.wait(timeout=10)
+            return original_record(
+                session_id, session_key, incoming, *args, **kwargs
+            )
+
+        store._acquire_origin_refresh_lock = observed_acquire  # type: ignore[method-assign]
+        store._record_gateway_session_peer = blocked_record  # type: ignore[method-assign]
+
+        def update():
+            actor.label = "update"
+            store.update_session(entry.session_key, last_prompt_tokens=17)
+
+        def refresh():
+            actor.label = "refresh"
+            store._refresh_dynamic_origin_for_turn(entry, source_b)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            update_future = pool.submit(update)
+            assert update_at_peer.wait(timeout=10)
+            refresh_future = pool.submit(refresh)
+            assert refresh_attempted_serializer.wait(timeout=10)
+            if update_has_serializer.is_set():
+                # Fixed path: update owns the key and refresh is queued behind it.
+                release_update.set()
+            else:
+                # Buggy path: refresh can complete while update holds stale A.
+                refresh_future.result(timeout=10)
+                release_update.set()
+            update_future.result(timeout=10)
+            refresh_future.result(timeout=10)
+
+        live = store._entries[entry.session_key]
+        assert live.origin is source_b
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing = SessionEntry.from_dict(
+            json.loads(routing_rows[entry.session_key])
+        )
+        row = store._db.get_session(entry.session_id)
+        assert row is not None
+        assert routing.origin is not None
+        assert routing.origin.transport_platform == Platform.RELAY
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+        assert row["display_name"] == "relay-B"
+
+    @pytest.mark.parametrize("lifecycle", ["switch", "reset"])
+    def test_feature_on_lifecycle_peer_write_cannot_regress_newer_origin_commit(
+        self, tmp_path, lifecycle
+    ):
+        """A delayed lifecycle peer write cannot overwrite a newer live origin."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        source_a = self._source()
+        source_a.profile = "coder"
+        source_a.chat_name = "native-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        original_entry = store.get_or_create_session(source_a)
+
+        target_session_id = "resume-target"
+        if lifecycle == "switch":
+            store._db.create_session(
+                target_session_id,
+                source="telegram",
+                user_id=source_a.user_id,
+            )
+
+        source_b = self._source()
+        source_b.profile = "coder"
+        source_b.chat_name = "relay-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        lifecycle_at_peer = threading.Event()
+        release_lifecycle = threading.Event()
+        lifecycle_has_serializer = threading.Event()
+        refresh_attempted_serializer = threading.Event()
+        actor = threading.local()
+        original_acquire = store._acquire_origin_refresh_lock
+        original_record = store._record_gateway_session_peer
+
+        def observed_acquire(session_key):
+            label = getattr(actor, "label", None)
+            if label == "refresh":
+                refresh_attempted_serializer.set()
+            keyed = original_acquire(session_key)
+            if label == "lifecycle":
+                lifecycle_has_serializer.set()
+            return keyed
+
+        def blocked_record(session_id, session_key, incoming, *args, **kwargs):
+            if getattr(actor, "label", None) == "lifecycle":
+                lifecycle_at_peer.set()
+                assert release_lifecycle.wait(timeout=10)
+            return original_record(
+                session_id, session_key, incoming, *args, **kwargs
+            )
+
+        store._acquire_origin_refresh_lock = observed_acquire  # type: ignore[method-assign]
+        store._record_gateway_session_peer = blocked_record  # type: ignore[method-assign]
+
+        def run_lifecycle():
+            actor.label = "lifecycle"
+            if lifecycle == "switch":
+                return store.switch_session(
+                    original_entry.session_key,
+                    target_session_id,
+                )
+            return store.reset_session(original_entry.session_key)
+
+        def refresh():
+            actor.label = "refresh"
+            with store._lock:
+                current = store._entries[original_entry.session_key]
+            store._refresh_dynamic_origin_for_turn(current, source_b)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            lifecycle_future = pool.submit(run_lifecycle)
+            assert lifecycle_at_peer.wait(timeout=10)
+            with store._lock:
+                published = store._entries[original_entry.session_key]
+                published_session_id = published.session_id
+            assert published_session_id != original_entry.session_id
+
+            refresh_future = pool.submit(refresh)
+            assert refresh_attempted_serializer.wait(timeout=10)
+            if lifecycle_has_serializer.is_set():
+                release_lifecycle.set()
+            else:
+                refresh_future.result(timeout=10)
+                release_lifecycle.set()
+            lifecycle_future.result(timeout=10)
+            refresh_future.result(timeout=10)
+
+        live = store._entries[original_entry.session_key]
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing = SessionEntry.from_dict(
+            json.loads(routing_rows[original_entry.session_key])
+        )
+        row = store._db.get_session(live.session_id)
+        assert row is not None
+        assert live.session_id == published_session_id
+        assert live.origin is source_b
+        assert routing.session_id == published_session_id
+        assert routing.origin is not None
+        assert routing.origin.transport_platform == Platform.RELAY
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+        assert row["display_name"] == "relay-B"
+
+    def test_feature_on_update_session_keeps_single_entry_fast_path(self, tmp_path):
+        """Metadata-only writes must not rewrite the complete routing index."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = self._source()
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+        entry = store.get_or_create_session(source)
+
+        save_one = MagicMock(wraps=store._db.save_gateway_routing_entry)
+        replace_all = MagicMock(wraps=store._db.replace_gateway_routing_entries)
+        save_json = MagicMock(wraps=store._save_sessions_json)
+        store._db.save_gateway_routing_entry = save_one
+        store._db.replace_gateway_routing_entries = replace_all
+        store._save_sessions_json = save_json
+
+        store.update_session(entry.session_key, last_prompt_tokens=23)
+
+        assert save_one.call_count == 1
+        assert replace_all.call_count == 0
+        assert save_json.call_count == 0
+        row = store._db.get_session(entry.session_id)
+        assert row is not None
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+
+    @pytest.mark.parametrize("failure_point", ["routing", "json", "peer"])
+    def test_origin_commit_failure_is_signaled_and_retry_heals_all_views(
+        self, tmp_path, failure_point
+    ):
+        """A partial provenance write is never reported as a successful commit."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source_a = self._source()
+        source_a.profile = "coder"
+        source_a.chat_name = "native-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        entry = store.get_or_create_session(source_a)
+
+        source_b = self._source()
+        source_b.profile = "coder"
+        source_b.chat_name = "relay-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        if failure_point == "routing":
+            target = store._db
+            name = "replace_gateway_routing_entries"
+        elif failure_point == "json":
+            target = store
+            name = "_save_sessions_json"
+        else:
+            target = store._db
+            name = "record_gateway_session_peer"
+        original = getattr(target, name)
+        failed = False
+
+        def fail_once(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise RuntimeError(f"injected {failure_point} failure")
+            return original(*args, **kwargs)
+
+        setattr(target, name, fail_once)
+        with pytest.raises(RuntimeError, match="origin provenance persistence failed"):
+            store._refresh_dynamic_origin_for_turn(entry, source_b)
+        assert store._origin_refresh_registry == {}
+
+        store._refresh_dynamic_origin_for_turn(entry, source_b)
+
+        sessions_json = json.loads((tmp_path / "sessions.json").read_text())
+        json_entry = SessionEntry.from_dict(sessions_json[entry.session_key])
+        routing_rows = store._db.load_gateway_routing_entries(
+            scope=store._routing_scope()
+        )
+        routing_entry = SessionEntry.from_dict(
+            json.loads(routing_rows[entry.session_key])
+        )
+        row = store._db.get_session(entry.session_id)
+        assert row is not None
+        assert store._entries[entry.session_key].origin is source_b
+        assert json_entry.origin is not None
+        assert json_entry.origin.transport_platform == Platform.RELAY
+        assert routing_entry.origin is not None
+        assert routing_entry.origin.transport_platform == Platform.RELAY
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+        assert row["display_name"] == "relay-B"
+
+    def test_adjacent_flight_cannot_overtake_old_origin_waiter(self, tmp_path):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        def source(name, transport):
+            value = self._source()
+            value.profile = "coder"
+            value.chat_name = name
+            value.transport_owner_profile = "default"
+            value.transport_platform = transport
+            return value
+
+        owner_source = source("owner", Platform.TELEGRAM)
+        waiter_source = source("old-waiter", Platform.TELEGRAM)
+        adjacent_source = source("adjacent-flight", Platform.RELAY)
+        owner_in_impl = threading.Event()
+        release_owner = threading.Event()
+        waiter_peer_started = threading.Event()
+        release_waiter_peer = threading.Event()
+        adjacent_impl_finished = threading.Event()
+        record_order = []
+
+        original_impl = store._get_or_create_session_impl
+        original_record = store._record_gateway_session_peer
+
+        def blocked_impl(incoming, *args, **kwargs):
+            if incoming.chat_name == "owner":
+                owner_in_impl.set()
+                assert release_owner.wait(timeout=10)
+            result = original_impl(incoming, *args, **kwargs)
+            if incoming.chat_name == "adjacent-flight":
+                adjacent_impl_finished.set()
+            return result
+
+        def ordered_record(session_id, session_key, incoming, *args, **kwargs):
+            if incoming is not None and incoming.chat_name == "old-waiter":
+                waiter_peer_started.set()
+                assert release_waiter_peer.wait(timeout=10)
+            result = original_record(session_id, session_key, incoming, *args, **kwargs)
+            if incoming is not None and incoming.chat_name in {
+                "old-waiter",
+                "adjacent-flight",
+            }:
+                record_order.append(incoming.chat_name)
+            return result
+
+        store._get_or_create_session_impl = blocked_impl  # type: ignore[method-assign]
+        store._record_gateway_session_peer = ordered_record  # type: ignore[method-assign]
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            owner_future = pool.submit(store.get_or_create_session, owner_source)
+            assert owner_in_impl.wait(timeout=10)
+            waiter_future = pool.submit(store.get_or_create_session, waiter_source)
+            release_owner.set()
+            owner = owner_future.result(timeout=10)
+            assert waiter_peer_started.wait(timeout=10)
+
+            # The owner future has completed its finally block, so the next
+            # call owns a new _SessionFlight while the old waiter is still in
+            # its provenance commit.
+            adjacent_future = pool.submit(
+                store.get_or_create_session,
+                adjacent_source,
+            )
+            assert adjacent_impl_finished.wait(timeout=10)
+            release_waiter_peer.set()
+            waiter = waiter_future.result(timeout=10)
+            adjacent = adjacent_future.result(timeout=10)
+
+        assert owner.session_id == waiter.session_id == adjacent.session_id
+        assert record_order == ["old-waiter", "adjacent-flight"]
+        assert adjacent.origin is adjacent_source
+        row = store._db.get_session(adjacent.session_id)
+        assert row is not None
+        assert json.loads(row["origin_json"])["transport_platform"] == "relay"
+
+    def test_origin_serializer_commits_queued_callers_in_arrival_order(
+        self, tmp_path
+    ):
+        """A later adjacent owner cannot barge ahead of an old queued waiter."""
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+
+        initial = self._source()
+        initial.profile = "coder"
+        initial.chat_name = "initial"
+        initial.transport_owner_profile = "default"
+        initial.transport_platform = Platform.TELEGRAM
+        entry = store.get_or_create_session(initial)
+
+        def source(name, transport):
+            value = self._source()
+            value.profile = "coder"
+            value.chat_name = name
+            value.transport_owner_profile = "default"
+            value.transport_platform = transport
+            return value
+
+        old_source = source("old-waiter", Platform.TELEGRAM)
+        adjacent_source = source("adjacent-flight", Platform.RELAY)
+        old_queued = threading.Event()
+        adjacent_queued = threading.Event()
+        actor = threading.local()
+        assigned_tickets = {}
+        commit_order = []
+        original_acquire = store._acquire_origin_refresh_lock
+        original_record = store._record_gateway_session_peer
+
+        def observed_record(session_id, session_key, incoming, *args, **kwargs):
+            result = original_record(
+                session_id, session_key, incoming, *args, **kwargs
+            )
+            if incoming is not None and incoming.chat_name in {
+                "old-waiter",
+                "adjacent-flight",
+            }:
+                commit_order.append(incoming.chat_name)
+            return result
+
+        store._record_gateway_session_peer = observed_record  # type: ignore[method-assign]
+        owner_lock = original_acquire(entry.session_key)
+        keyed = store._origin_refresh_registry[entry.session_key]
+
+        class TicketObservedCondition(threading.Condition):
+            def wait(self, timeout=None):
+                label = actor.label
+                assigned_tickets[label] = keyed.next_ticket - 1
+                if label == "old-waiter":
+                    old_queued.set()
+                elif label == "adjacent-flight":
+                    adjacent_queued.set()
+                return super().wait(timeout)
+
+        # The owner is outside its condition critical section now.  Replace
+        # only the test's wait observer so each Event fires after the real
+        # acquire path has allocated a ticket and reached its queued wait.
+        keyed.condition = TicketObservedCondition()
+
+        def refresh(label, incoming):
+            actor.label = label
+            store._refresh_dynamic_origin_for_turn(entry, incoming)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                old_future = pool.submit(refresh, "old-waiter", old_source)
+                assert old_queued.wait(timeout=10)
+                with keyed.condition:
+                    assert keyed.next_ticket == 2
+                adjacent_future = pool.submit(
+                    refresh, "adjacent-flight", adjacent_source
+                )
+                assert adjacent_queued.wait(timeout=10)
+                with keyed.condition:
+                    assert keyed.next_ticket == 3
+                store._release_origin_refresh_lock(entry.session_key, owner_lock)
+                owner_lock = None
+                old_future.result(timeout=10)
+                adjacent_future.result(timeout=10)
+        finally:
+            if owner_lock is not None:
+                store._release_origin_refresh_lock(entry.session_key, owner_lock)
+
+        assert commit_order == ["old-waiter", "adjacent-flight"]
+        assert assigned_tickets == {"old-waiter": 1, "adjacent-flight": 2}
+        assert store._origin_refresh_registry == {}
+
+    def test_blocked_origin_commit_for_one_key_does_not_block_another_key(
+        self, tmp_path
+    ):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source_a = self._source(chat_id="chat-A", user_id="user-A")
+        source_a.profile = "coder"
+        source_a.chat_name = "key-A"
+        source_a.transport_owner_profile = "default"
+        source_a.transport_platform = Platform.TELEGRAM
+        source_b = self._source(chat_id="chat-B", user_id="user-B")
+        source_b.profile = "coder"
+        source_b.chat_name = "key-B"
+        source_b.transport_owner_profile = "default"
+        source_b.transport_platform = Platform.RELAY
+
+        a_at_persistence = threading.Event()
+        release_a = threading.Event()
+        b_at_persistence = threading.Event()
+        original_persist = store._persist_routing_data
+
+        def ordered_persist(data, generation, **kwargs):
+            names = {
+                item.get("display_name")
+                for key, item in data.items()
+                if not key.startswith("_")
+            }
+            if "key-A" in names and "key-B" not in names:
+                a_at_persistence.set()
+                assert release_a.wait(timeout=10)
+            if "key-B" in names:
+                b_at_persistence.set()
+            return original_persist(data, generation, **kwargs)
+
+        store._persist_routing_data = ordered_persist  # type: ignore[method-assign]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(store.get_or_create_session, source_a)
+            assert a_at_persistence.wait(timeout=10)
+            future_b = pool.submit(store.get_or_create_session, source_b)
+            assert b_at_persistence.wait(timeout=10)
+            release_a.set()
+            entry_a = future_a.result(timeout=10)
+            entry_b = future_b.result(timeout=10)
+
+        assert entry_a.session_key != entry_b.session_key
+
+    def test_legacy_dynamic_session_backfills_transport_provenance(self, tmp_path):
+        config = GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        )
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        legacy = self._source()
+        legacy.profile = "coder"
+        original = store.get_or_create_session(legacy)
+
+        incoming = self._source()
+        incoming.profile = "coder"
+        incoming.transport_owner_profile = "default"
+        incoming.transport_platform = Platform.RELAY
+        reused = store.get_or_create_session(incoming)
+
+        assert reused.session_id == original.session_id
+        assert reused.origin is incoming
+        assert reused.origin.transport_owner_profile == "default"
+        assert reused.origin.transport_platform == Platform.RELAY
+
+    def test_feature_off_does_not_persist_transport_provenance(self, tmp_path):
+        config = GatewayConfig(multiplex_profiles=True)
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        source = self._source()
+        source.profile = "coder"
+        source.transport_owner_profile = "default"
+        source.transport_platform = Platform.RELAY
+
+        entry = store.get_or_create_session(source)
+
+        assert entry.origin is not None
+        assert entry.origin.transport_owner_profile is None
+        assert entry.origin.transport_platform is None
+        persisted = json.loads((tmp_path / "sessions.json").read_text())
+        origin = persisted[entry.session_key]["origin"]
+        assert "transport_owner_profile" not in origin
+        assert "transport_platform" not in origin
+
     def test_write_sessions_json_false_stops_producing_file(self, tmp_path):
         config = GatewayConfig(write_sessions_json=False)
         store = SessionStore(sessions_dir=tmp_path, config=config)
@@ -1642,5 +2540,3 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
-

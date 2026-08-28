@@ -219,9 +219,10 @@ exactly as they do with separate gateways.
 
 ### Serving selected profiles
 
-By default, `gateway.multiplex_profiles: true` serves every valid named profile
-on the host. To keep unrelated profiles installed without starting their
-adapters or cron jobs, set `gateway.multiplex_profile_allowlist`:
+With dynamic profile switching off, `gateway.multiplex_profiles: true` keeps
+the historical behavior of serving every valid named profile on the host. To
+keep unrelated profiles installed without starting their adapters or cron
+jobs, set `gateway.multiplex_profile_allowlist`:
 
 ```yaml
 gateway:
@@ -231,11 +232,22 @@ gateway:
     - guest
 ```
 
-The default profile is always served and does not need to be listed. An unset
-allowlist preserves the historical serve-all behavior; an empty list serves
-only the default profile. Names are normalized and deduplicated. Invalid list
-entries or names that are not installed are skipped with a warning. A malformed
-non-list value fails safely to default-only.
+The default profile is always served and does not need to be listed. When
+`gateway.profile_switching.enabled: true`, this allowlist becomes a mandatory
+security boundary: omission and YAML `null` are rejected, while an explicit
+`[]` serves only the default profile. Hermes never scans installed profile
+directories to infer the dynamic-routing served set. Names are normalized and
+deduplicated. Invalid list entries or names that are not installed are skipped
+with a warning. A malformed non-list value fails safely to default-only.
+
+`gateway.profile_switching.hidden` affects dynamic visibility and policy only;
+it does not stop adapters, cron, API/webhook prefixes, or other multiplex
+topology from serving a profile. Only the allowlist defines that boundary.
+
+For feature-off configurations, an omitted or `null` allowlist continues to
+mean serve all. To migrate an older feature-on configuration that relied on
+that implicit discovery, add the full intended list before restarting, or add
+`multiplex_profile_allowlist: []` for default-only.
 
 The resulting served set also controls `/p/<profile>/` API and webhook prefixes,
 runtime status, profile-route eligibility, and which profiles the in-process

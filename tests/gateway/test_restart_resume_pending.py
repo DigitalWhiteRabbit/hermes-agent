@@ -32,7 +32,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, HomeChannel, Platform
+from gateway.config import (
+    GatewayConfig,
+    HomeChannel,
+    Platform,
+    ProfileSwitchingConfig,
+)
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
@@ -705,6 +710,323 @@ async def test_reconnect_reschedule_is_platform_scoped():
 
 
 @pytest.mark.asyncio
+async def test_dynamic_profile_auto_resume_uses_persisted_primary_owner():
+    runner, primary = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    runner.config.multiplex_profile_allowlist = ["coder"]
+    runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
+    secondary = object()
+    runner._profile_adapters = {
+        "coder": {Platform.TELEGRAM: secondary},
+    }
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="dynamic-chat",
+        chat_type="dm",
+        user_id="u1",
+        profile="coder",
+        transport_owner_profile="default",
+    )
+    pending_entry = SessionEntry(
+        session_key="agent:coder:telegram:dm:dynamic-chat",
+        session_id="sid-dynamic",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    primary.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    primary.handle_message.assert_awaited_once()
+    resumed = primary.handle_message.await_args.args[0]
+    assert resumed.source.profile == "coder"
+    assert resumed.source.transport_owner_profile == "default"
+    assert pending_entry.session_key == "agent:coder:telegram:dm:dynamic-chat"
+
+
+@pytest.mark.asyncio
+async def test_persisted_relay_session_resumes_through_relay_not_native_adapter(
+    tmp_path,
+    monkeypatch,
+):
+    runner, native = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    runner.config.multiplex_profile_allowlist = ["coder"]
+    runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
+    _clear_names = (
+        "DISCORD_ALLOWED_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "DISCORD_ALLOW_ALL_USERS",
+    )
+    for name in _clear_names:
+        monkeypatch.delenv(name, raising=False)
+    relay = MagicMock(
+        authorization_is_upstream=True,
+        enforces_own_access_policy=False,
+    )
+    relay.handle_message = AsyncMock()
+    native.handle_message = AsyncMock()
+    runner.adapters = {
+        Platform.DISCORD: native,
+        Platform.RELAY: relay,
+    }
+    # Exercise the real restored-source authorization path, not the permissive
+    # lightweight runner seam installed by make_restart_runner().
+    del runner._is_user_authorized
+    persisted = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
+    )
+    persisted._db = None
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="relay-chat",
+        chat_type="dm",
+        user_id="u1",
+        profile="coder",
+        transport_owner_profile="default",
+        delivered_via_upstream_relay=True,
+    )
+    pending_entry = persisted.get_or_create_session(source)
+    assert persisted.mark_resume_pending(
+        pending_entry.session_key,
+        "restart_interrupted",
+    )
+
+    restarted = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
+    )
+    restarted._db = None
+    restarted._ensure_loaded()
+    runner.session_store = restarted
+    restored = restarted._entries[pending_entry.session_key].origin
+    assert restored is not None
+    assert restored.delivered_via_upstream_relay is False
+
+    assert runner._is_user_authorized(restored) is True
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    relay.handle_message.assert_awaited_once()
+    native.handle_message.assert_not_called()
+    resumed = relay.handle_message.await_args.args[0]
+    assert resumed.source.profile == "coder"
+    assert resumed.source.transport_platform == Platform.RELAY
+    assert pending_entry.session_key == "agent:coder:discord:dm:relay-chat"
+
+
+@pytest.mark.asyncio
+async def test_relay_reconnect_retries_only_persisted_relay_transport_bucket(
+    tmp_path,
+    monkeypatch,
+):
+    runner, native = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    runner.config.multiplex_profile_allowlist = ["coder"]
+    runner.config.profile_switching = ProfileSwitchingConfig(enabled=True)
+    for name in (
+        "DISCORD_ALLOWED_USERS",
+        "GATEWAY_ALLOWED_USERS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "DISCORD_ALLOW_ALL_USERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    native.handle_message = AsyncMock()
+    runner.adapters = {Platform.DISCORD: native}
+    del runner._is_user_authorized
+    runner._restart_loop_guard_config = lambda: (99, 60, 300)
+
+    persisted = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
+    )
+    persisted._db = None
+    relay_entry = persisted.get_or_create_session(
+        SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="relay-chat",
+            chat_type="dm",
+            user_id="relay-user",
+            profile="coder",
+            transport_owner_profile="default",
+            delivered_via_upstream_relay=True,
+        )
+    )
+    native_entry = persisted.get_or_create_session(
+        SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="native-chat",
+            chat_type="dm",
+            user_id="native-user",
+            transport_owner_profile="default",
+            transport_platform=Platform.DISCORD,
+        )
+    )
+    legacy_entry = persisted.get_or_create_session(
+        SessionSource(
+            platform=Platform.SLACK,
+            chat_id="legacy-chat",
+            chat_type="dm",
+            user_id="legacy-user",
+        )
+    )
+    for entry in (relay_entry, native_entry, legacy_entry):
+        assert persisted.mark_resume_pending(
+            entry.session_key,
+            "restart_interrupted",
+        )
+
+    restarted = SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(
+            multiplex_profiles=True,
+            multiplex_profile_allowlist=["coder"],
+            profile_switching=ProfileSwitchingConfig(enabled=True),
+        ),
+    )
+    restarted._db = None
+    restarted._ensure_loaded()
+    invalid_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="invalid-kind-chat",
+        chat_type="dm",
+        user_id="invalid-user",
+    )
+    invalid_source.transport_platform = "future-transport"
+    invalid_entry = SessionEntry(
+        session_key="agent:default:discord:dm:invalid-kind-chat",
+        session_id="invalid-kind-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=invalid_source,
+        platform=Platform.DISCORD,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_interrupted",
+        last_resume_marked_at=datetime.now(),
+    )
+    restarted._entries[invalid_entry.session_key] = invalid_entry
+    runner.session_store = restarted
+
+    # Initial startup/reconnect attempt while Relay is unavailable retains the
+    # pending Relay session and never falls through to the native Discord bot.
+    assert runner._schedule_resume_pending_sessions(platform=Platform.RELAY) == 0
+    native.handle_message.assert_not_called()
+    assert restarted._entries[relay_entry.session_key].resume_pending is True
+
+    relay = MagicMock(
+        authorization_is_upstream=True,
+        enforces_own_access_policy=False,
+    )
+    relay.handle_message = AsyncMock()
+    runner.adapters[Platform.RELAY] = relay
+    restored_relay = restarted._entries[relay_entry.session_key].origin
+    assert restored_relay is not None
+    assert runner._is_user_authorized(restored_relay) is True
+
+    scheduled = runner._schedule_resume_pending_sessions(platform=Platform.RELAY)
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    relay.handle_message.assert_awaited_once()
+    native.handle_message.assert_not_called()
+    resumed = relay.handle_message.await_args.args[0]
+    assert resumed.source.chat_id == "relay-chat"
+    assert resumed.source.platform == Platform.DISCORD
+    assert resumed.source.transport_platform == Platform.RELAY
+    for entry in (native_entry, legacy_entry, invalid_entry):
+        assert restarted._entries[entry.session_key].resume_pending is True
+
+    # A valid native kind and an unrecognized kind both stay in the underlying
+    # Discord bucket; neither is cross-selected as Relay provenance.
+    runner._is_user_authorized = lambda _source: True
+    scheduled_native = runner._schedule_resume_pending_sessions(
+        platform=Platform.DISCORD
+    )
+    await asyncio.sleep(0)
+
+    assert scheduled_native == 2
+    assert native.handle_message.await_count == 2
+    assert {
+        call.args[0].source.chat_id for call in native.handle_message.await_args_list
+    } == {"native-chat", "invalid-kind-chat"}
+    relay.handle_message.assert_awaited_once()
+    assert restarted._entries[legacy_entry.session_key].resume_pending is True
+
+
+def test_legacy_resume_source_without_transport_owner_keeps_profile_lookup():
+    runner, primary = make_restart_runner()
+    secondary = object()
+    runner._profile_adapters = {
+        "coder": {Platform.TELEGRAM: secondary},
+    }
+    source = SessionSource.from_dict({
+        "platform": "telegram",
+        "chat_id": "legacy-chat",
+        "profile": "coder",
+    })
+
+    assert runner._adapter_for_source(source) is secondary
+    assert runner._adapter_for_source(make_restart_source()) is primary
+    assert source.transport_platform is None
+
+
+def test_feature_off_restart_omits_provenance_and_keeps_profile_adapter_fallback(
+    tmp_path,
+):
+    config = GatewayConfig(multiplex_profiles=True)
+    persisted = SessionStore(sessions_dir=tmp_path, config=config)
+    persisted._db = None
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="feature-off-chat",
+        chat_type="dm",
+        user_id="u1",
+        profile="coder",
+        transport_owner_profile="default",
+        transport_platform=Platform.RELAY,
+    )
+    entry = persisted.get_or_create_session(source)
+
+    restarted = SessionStore(sessions_dir=tmp_path, config=config)
+    restarted._db = None
+    restarted._ensure_loaded()
+    restored = restarted._entries[entry.session_key].origin
+    assert restored is not None
+    assert restored.transport_owner_profile is None
+    assert restored.transport_platform is None
+
+    runner, _primary = make_restart_runner()
+    secondary = object()
+    runner._profile_adapters = {"coder": {Platform.TELEGRAM: secondary}}
+    assert runner._adapter_for_source(restored) is secondary
+
+
+@pytest.mark.asyncio
 async def test_startup_restore_waits_for_resume_before_draining_inbound():
     """Queued inbound turns replay only after startup resume tasks finish."""
     runner, adapter = make_restart_runner()
@@ -1164,5 +1486,3 @@ async def test_startup_boot_sends_still_run_when_they_finish_quickly(monkeypatch
     runner._send_restart_notification.assert_awaited_once()
     runner._claim_pending_obligations.assert_awaited_once()
     runner._redeliver_claimed_obligations.assert_awaited_once()
-
-

@@ -84,8 +84,37 @@ def _coerce_allow_set(raw) -> set[str]:
     return {part.strip() for part in str(raw).split(",") if part.strip()}
 
 
+def _normalize_transport_platform(value: object) -> Optional[Platform]:
+    """Return trusted persisted transport provenance, or ``None``.
+
+    Exact runtime types are intentional. ``isinstance`` is unsafe here because
+    mocks and arbitrary proxies can spoof ``__class__`` and impersonate a
+    ``Platform`` member. Plain persisted strings are normalized to the enum so
+    subsequent adapter and authorization lookups use a trusted key.
+    """
+    if type(value) is Platform:
+        return value
+    if type(value) is not str:
+        return None
+    try:
+        return Platform(value)
+    except ValueError:
+        return None
+
+
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
+
+    def _profile_switching_provenance_enabled(self) -> bool:
+        """Use durable transport provenance only for the opt-in feature."""
+        return (
+            getattr(
+                getattr(getattr(self, "config", None), "profile_switching", None),
+                "enabled",
+                False,
+            )
+            is True
+        )
 
     def _authorization_adapter(
         self,
@@ -144,6 +173,27 @@ class GatewayAuthorizationMixin:
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
+        if self._profile_switching_provenance_enabled():
+            transport_owner = getattr(source, "transport_owner_profile", None)
+            transport_platform = _normalize_transport_platform(
+                getattr(source, "transport_platform", None)
+            )
+            if transport_platform is not None:
+                owner_profile = (
+                    transport_owner.strip()
+                    if isinstance(transport_owner, str) and transport_owner.strip()
+                    else None
+                )
+                return self._authorization_adapter(
+                    transport_platform,
+                    None if owner_profile in {None, "default"} else owner_profile,
+                )
+            if isinstance(transport_owner, str) and transport_owner.strip():
+                owner_profile = transport_owner.strip()
+                return self._authorization_adapter(
+                    getattr(source, "platform", None),
+                    None if owner_profile == "default" else owner_profile,
+                )
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
@@ -186,6 +236,25 @@ class GatewayAuthorizationMixin:
             ).items():
                 if adapter is profile_adapters.get(platform):
                     return profile
+        if self._profile_switching_provenance_enabled():
+            transport_owner = getattr(source, "transport_owner_profile", None)
+            if isinstance(transport_owner, str) and transport_owner.strip():
+                owner_profile = transport_owner.strip()
+                return None if owner_profile == "default" else owner_profile
+        return getattr(source, "profile", None)
+
+    def _authorization_profile_for_source(
+        self,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Return the profile that owns ingress authorization for *source*.
+
+        Dynamic routing changes ``source.profile`` to select runtime/session
+        state, but it must not change the bot account's pairing or intake
+        policy.  Keep legacy runtime-profile selection when the feature is off.
+        """
+        if self._profile_switching_provenance_enabled():
+            return self._adapter_profile_for_source(source)
         return getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(
@@ -366,16 +435,20 @@ class GatewayAuthorizationMixin:
         return False
 
     def _pairing_store_for(self, source: "SessionSource"):
-        """Pick the per-profile PairingStore for a source, falling back to global.
+        """Pick the PairingStore owned by the source's ingress transport.
 
-        In a multiplexing gateway, each profile owns its own pairing whitelist
-        so isolation is preserved. When the source has no profile (single-
-        profile gateway, or a path that hasn't stamped profile yet) or the
-        profile isn't registered, fall back to ``self.pairing_store`` (the
-        global default) so existing behavior is preserved.
+        Feature-on routing separates runtime identity from transport ownership:
+        the primary/default transport uses the global store even after routing,
+        while named secondary transports require their own store and fail
+        closed when it is absent. Feature-off keeps the historical runtime-
+        profile lookup and global fallback.
         """
         per_profile = getattr(self, "pairing_stores", None) or {}
-        profile = getattr(source, "profile", None)
+        profile = self._authorization_profile_for_source(source)
+        if self._profile_switching_provenance_enabled():
+            if profile in {None, "default"}:
+                return getattr(self, "pairing_store", None)
+            return per_profile.get(profile)
         if profile and profile in per_profile:
             return per_profile[profile]
         return getattr(self, "pairing_store", None)
@@ -406,6 +479,14 @@ class GatewayAuthorizationMixin:
             return True
 
         adapter_profile = self._adapter_profile_for_source(source)
+        authorization_platform = source.platform
+        if self._profile_switching_provenance_enabled():
+            authorization_platform = (
+                _normalize_transport_platform(
+                    getattr(source, "transport_platform", None)
+                )
+                or source.platform
+            )
 
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
@@ -437,7 +518,7 @@ class GatewayAuthorizationMixin:
         if allow_adapter_delegation and (
             source.delivered_via_upstream_relay is True
             or self._adapter_authorization_is_upstream(
-                source.platform,
+                authorization_platform,
                 profile=adapter_profile,
             )
         ):
@@ -800,7 +881,9 @@ class GatewayAuthorizationMixin:
         """Return how unauthorized DMs should be handled for a platform.
 
         Resolution order:
-        1. Explicit per-platform ``unauthorized_dm_behavior`` in config — always wins.
+        1. With profile switching enabled, explicit per-platform
+           ``unauthorized_dm_behavior`` from the transport-owning adapter
+           wins.
         2. Email defaults to ``"ignore"`` unless explicitly opted into
            pairing. Inboxes may contain arbitrary unread human messages, so
            replying with pairing codes is not a safe platform default.
@@ -817,7 +900,29 @@ class GatewayAuthorizationMixin:
         """
         config = getattr(self, "config", None)
 
-        # Check for an explicit per-platform override first.
+        # In multiplex mode each live adapter owns its intake policy.  Resolve
+        # the explicit override from that adapter before consulting the
+        # runner's primary/global configuration, just as ``dm_policy`` does
+        # below.  Directly constructed PlatformConfig instances may contain
+        # unnormalized values, so accept only the two supported behaviors.
+        if platform and self._profile_switching_provenance_enabled():
+            adapter = self._authorization_adapter(platform, profile)
+            adapter_config = getattr(adapter, "config", None)
+            adapter_extra = getattr(adapter_config, "extra", None)
+            if (
+                isinstance(adapter_extra, dict)
+                and "unauthorized_dm_behavior" in adapter_extra
+            ):
+                adapter_behavior = (
+                    str(adapter_extra.get("unauthorized_dm_behavior") or "")
+                    .strip()
+                    .lower()
+                )
+                if adapter_behavior in {"pair", "ignore"}:
+                    return adapter_behavior
+
+        # Fall back to the runner's explicit per-platform override for bare
+        # runners and the primary/default adapter.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
             platform_cfg = config.platforms.get(platform) if hasattr(config, "platforms") else None
             if platform_cfg and "unauthorized_dm_behavior" in getattr(platform_cfg, "extra", {}):

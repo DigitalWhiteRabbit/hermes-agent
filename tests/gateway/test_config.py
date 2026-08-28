@@ -416,6 +416,61 @@ class TestLoadGatewayConfig:
         assert config.multiplex_profiles is True
         assert config.multiplex_profile_allowlist == ["worker", "guest"]
 
+    def test_profile_switching_from_nested_gateway_section(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  multiplex_profiles: true\n"
+            "  multiplex_profile_allowlist:\n"
+            "    - coder\n"
+            "  profile_switching:\n"
+            "    enabled: true\n"
+            "    default_visible:\n"
+            "      - default\n"
+            "      - coder\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.profile_switching.enabled is True
+        assert config.profile_switching.default_visible == ("default", "coder")
+
+    @pytest.mark.parametrize(
+        "allowlist_yaml",
+        ["", "  multiplex_profile_allowlist: null\n"],
+    )
+    def test_real_config_load_rejects_enabled_switching_without_finite_allowlist(
+        self,
+        tmp_path,
+        monkeypatch,
+        allowlist_yaml,
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  multiplex_profiles: true\n"
+            f"{allowlist_yaml}"
+            "  profile_switching:\n"
+            "    enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                "profile_switching.enabled requires an explicit "
+                "gateway.multiplex_profile_allowlist"
+            ),
+        ):
+            load_gateway_config()
+
+        assert not (hermes_home / "state" / "profile-routing.db").exists()
+
     def test_discord_websocket_health_settings_seed_platform_extra(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
